@@ -1,0 +1,5 @@
+boat_model_nirentan.txt
+model.zip
+*.csv
+.venv/
+__pycache__/

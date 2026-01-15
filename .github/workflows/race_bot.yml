@@ -1,0 +1,38 @@
+name: Kyotei Auto Bot
+
+on:
+  schedule:
+    # 15分おきに実行 (日本時間 08:30 - 21:00 / UTC 23:30 - 12:00)
+    - cron: '*/15 0-12,23 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # status.jsonの保存に必要
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas numpy lightgbm requests beautifulsoup4 google-generativeai discordwebhook
+
+      - name: Run Main Script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python main.py
+
+      - name: Commit and Push Status
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add status.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update status [skip ci]" && git push)
