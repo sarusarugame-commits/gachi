@@ -39,7 +39,7 @@ def engineer_features(df):
     return df
 
 def main():
-    print("🚀 Bot起動: テストモード (1会場のみ)")
+    print("🚀 Bot起動: テストモード (1会場のみチェック)", flush=True)
     
     # 解凍処理
     if not os.path.exists(MODEL_FILE):
@@ -56,7 +56,7 @@ def main():
     try:
         bst = lgb.Booster(model_file=MODEL_FILE)
     except:
-        print("❌ モデル読み込み失敗")
+        print("❌ モデル読み込み失敗", flush=True)
         return
 
     status = load_status()
@@ -70,7 +70,7 @@ def main():
 
             try:
                 # スクレイピング
-                print(f"🔍 Checking {race_id}...")
+                print(f"🔍 Checking {race_id}...", flush=True)
                 raw_data = scrape_race_data(None, jcd, rno, today)
                 if raw_data is None: continue
 
@@ -91,13 +91,13 @@ def main():
                 if prob > 0.4:
                     prompt = f"的中率{prob:.2f}の{combo}は買いですか？"
                     res = model_gemini.generate_content(prompt).text
-                    print(f"✨ 候補発見: {race_id} {combo}")
+                    print(f"✨ 候補発見: {race_id} {combo}", flush=True)
                     discord.post(content=f"🚀 {jcd}場{rno}R {combo}\n{res}")
                     status["notified"].append({"id": race_id, "combo": combo})
                     save_status(status)
 
             except Exception as e:
-                print(f"⚠️ Error {race_id}: {e}")
+                print(f"⚠️ Error {race_id}: {e}", flush=True)
 
 if __name__ == "__main__":
     main()
