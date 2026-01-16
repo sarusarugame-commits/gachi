@@ -39,7 +39,7 @@ def engineer_features(df):
     return df
 
 def main():
-    print("🚀 Bot起動: main.py (Updated Version)")
+    print("🚀 Bot起動: テストモード (1会場のみ)")
     
     # 解凍処理
     if not os.path.exists(MODEL_FILE):
@@ -62,7 +62,8 @@ def main():
     status = load_status()
     today = datetime.datetime.now().strftime('%Y%m%d')
     
-    for jcd in range(1, 25):
+    # ★テスト用に「1〜2 (つまり1場のみ)」に変更
+    for jcd in range(1, 2): 
         for rno in range(1, 13):
             race_id = f"{today}_{str(jcd).zfill(2)}_{rno}"
             if any(n['id'] == race_id for n in status["notified"]): continue
@@ -96,7 +97,6 @@ def main():
                     save_status(status)
 
             except Exception as e:
-                # 日本語エラーを表示
                 print(f"⚠️ Error {race_id}: {e}")
 
 if __name__ == "__main__":
