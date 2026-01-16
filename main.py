@@ -24,7 +24,7 @@ if not api_key:
 else:
     genai.configure(api_key=api_key)
 
-model_gemini = genai.GenerativeModel('gemini-1.5-flash')
+model_gemini = genai.GenerativeModel('gemini-3-flash-preview')
 discord = Discord(url=os.environ["DISCORD_WEBHOOK_URL"])
 
 MODEL_FILE = 'boat_model_nirentan.txt'
