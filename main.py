@@ -32,9 +32,12 @@ PLACE_NAMES = {
     19: "下関", 20: "若松", 21: "芦屋", 22: "福岡", 23: "唐津", 24: "大村"
 }
 
+# 報告を行う時間帯 (時)
+REPORT_HOURS = [13, 18, 23]
+
 def load_status():
     if not os.path.exists('status.json'):
-        return {"notified": [], "total_balance": 0}
+        return {"notified": [], "total_balance": 0, "last_report": ""}
     with open('status.json', 'r') as f:
         return json.load(f)
 
@@ -43,16 +46,13 @@ def save_status(status):
         json.dump(status, f, indent=4)
 
 def push_status_to_github():
-    """履歴を保存して重複とタイムアウト後の二重送りを防ぐ"""
     try:
         subprocess.run('git config --global user.name "github-actions[bot]"', shell=True)
         subprocess.run('git config --global user.email "github-actions[bot]@users.noreply.github.com"', shell=True)
         subprocess.run('git add status.json', shell=True)
-        # 競合回避のため、一度最新を取り込んでからpush
         subprocess.run('git pull origin main --rebase', shell=True)
         subprocess.run('git commit -m "Update status: Progress saved"', shell=True)
         subprocess.run('git push origin main', shell=True)
-        print("💾 進捗をGitHubに保存しました")
     except: pass
 
 def engineer_features(df):
@@ -73,12 +73,46 @@ def calculate_tansho_probs(probs):
         win_probs[first] += probs[idx]
     return win_probs
 
+def send_daily_report(status, current_hour):
+    """
+    指定された時間にその日の収支レポートを送信する
+    """
+    today = datetime.datetime.now().strftime('%Y%m%d')
+    today_races = [item for item in status["notified"] if item.get("date") == today and item.get("checked")]
+    
+    if not today_races:
+        # 今日まだ結果が出ていない場合はスキップ（ただし23時は送ってもいいかも）
+        if current_hour == 23:
+            discord.post(content=f"🌙 **23時の定期報告**\n本日は勝負レースがありませんでした。\n💰 通算収支: {status['total_balance']}円")
+        return
+
+    # 集計
+    win_count = sum(1 for item in today_races if item.get("is_win", False))
+    total_count = len(today_races)
+    today_profit = sum(item.get("profit", 0) for item in today_races)
+    win_rate = (win_count / total_count) * 100 if total_count > 0 else 0
+
+    emoji = "🌞" if current_hour == 13 else ("🌇" if current_hour == 18 else "🌙")
+    
+    msg = (
+        f"{emoji} **{current_hour}時の収支報告**\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📅 本日の戦績: {win_count}勝 {total_count - win_count}敗\n"
+        f"🎯 的中率: {win_rate:.1f}%\n"
+        f"💵 **本日収支: {'+' if today_profit > 0 else ''}{today_profit}円**\n"
+        f"💰 通算収支: {status['total_balance']}円\n"
+        f"━━━━━━━━━━━━━━"
+    )
+    discord.post(content=msg)
+
 def main():
     start_time = time.time()
-    print("🚀 Bot起動: 高速＆レジュームモード")
+    print("🚀 Bot起動: 定期報告対応版")
     session = requests.Session()
     status = load_status()
-    today = datetime.datetime.now().strftime('%Y%m%d')
+    now = datetime.datetime.now()
+    today = now.strftime('%Y%m%d')
+    current_hour = now.hour
 
     # モデル準備
     if not os.path.exists(MODEL_FILE):
@@ -96,63 +130,101 @@ def main():
         bst = lgb.Booster(model_file=MODEL_FILE)
     except: return
 
-    # 1. 結果確認 (未確認のものだけ)
+    # --- 1. 結果確認 ---
     print("📊 結果確認中...")
     updated = False
     for item in status["notified"]:
-        if item.get("checked") or item.get("date") != today: continue
+        if item.get("checked"): continue
+        
+        # 古いデータの補正
+        if "jcd" not in item:
+            try:
+                parts = item["id"].split("_")
+                item["date"], item["jcd"], item["rno"] = parts[0], int(parts[1]), int(parts[2])
+            except: continue
+
         res = scrape_result(session, item["jcd"], item["rno"], item["date"])
         if res:
             is_win = (res["combo"] == item["combo"])
-            status["total_balance"] += (res["payout"] - BET_AMOUNT) if is_win else -BET_AMOUNT
+            payout = res["payout"] if is_win else 0
+            profit = payout - BET_AMOUNT
+            
+            # 結果をstatusに記録（集計用）
+            status["total_balance"] += profit
             item["checked"] = True
+            item["is_win"] = is_win
+            item["profit"] = profit
             updated = True
+            
             place = PLACE_NAMES.get(item["jcd"], "会場")
-            discord.post(content=f"{'🎊 的中' if is_win else '💀 外れ'} {place}{item['rno']}R\n予測:{item['combo']}→結果:{res['combo']}\n通算:{status['total_balance']}円")
+            discord.post(content=f"{'🎊 的中' if is_win else '💀 外れ'} {place}{item['rno']}R\n予測:{item['combo']}→結果:{res['combo']}\n収支:{'+' if profit>0 else ''}{profit}円")
+    
     if updated: save_status(status)
 
-    # 2. 新規予想
-    print("🔍 パトロール中...")
-    for jcd in range(1, 25):
-        # タイムアウト対策：実行時間が50分を超えたら安全に終了して進捗保存
-        if time.time() - start_time > 3000:
-            print("⏳ タイムアウト防止のため一旦終了します")
-            break
+    # --- 2. 定期報告チェック ---
+    # "YYYYMMDD_HH" の形式で最後に報告した時間を記録し、重複を防ぐ
+    report_key = f"{today}_{current_hour}"
+    last_report = status.get("last_report", "")
+    
+    if current_hour in REPORT_HOURS and last_report != report_key:
+        print(f"📢 {current_hour}時の定期報告を送信します")
+        send_daily_report(status, current_hour)
+        status["last_report"] = report_key
+        save_status(status)
+        updated = True
+
+    # --- 3. 新規予想 ---
+    # 夜22時以降は新規予想をしない（報告のみ）
+    if current_hour < 22:
+        print("🔍 パトロール中...")
+        for jcd in range(1, 25):
+            if time.time() - start_time > 3000:
+                print("⏳ タイムアウト防止終了")
+                break
+                
+            venue_updated = False
+            for rno in range(1, 13):
+                race_id = f"{today}_{str(jcd).zfill(2)}_{rno}"
+                if any(n['id'] == race_id for n in status["notified"]): continue
+
+                try:
+                    raw_data = scrape_race_data(session, jcd, rno, today)
+                    if raw_data is None: continue
+
+                    df = pd.DataFrame([raw_data])
+                    df = engineer_features(df)
+                    
+                    # 特徴量リスト
+                    cols = ['jcd', 'rno', 'wind', 'wr_1_vs_avg']
+                    for i in range(1, 7): cols.extend([f'wr{i}', f'st{i}', f'ex{i}', f'power_idx_{i}'])
+                    for i in range(1, 6): cols.extend([f'st_gap_{i}_{i+1}', f'wr_gap_{i}_{i+1}'])
+
+                    probs = bst.predict(df[cols])[0]
+                    win_probs = calculate_tansho_probs(probs)
+                    best_boat = max(win_probs, key=win_probs.get)
+                    best_idx = np.argmax(probs)
+                    combo, prob = COMBOS[best_idx], probs[best_idx]
+                    
+                    # 閾値
+                    if prob > 0.4 or win_probs[best_boat] > 0.6:
+                        place = PLACE_NAMES.get(jcd, "会場")
+                        try:
+                            prompt = f"{place}{rno}R。単勝{best_boat}({win_probs[best_boat]:.0%})、二連単{combo}({prob:.0%})。推奨理由を一言。"
+                            res_gemini = model_gemini.generate_content(prompt).text
+                        except: res_gemini = "Gemini応答なし"
+
+                        discord.post(content=f"🚀 **勝負レース!** {place}{rno}R\n🛶 単勝:{best_boat}艇({win_probs[best_boat]:.0%})\n🔥 二連単:{combo}({prob:.0%})\n🤖 {res_gemini}\n[出走表](https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={today})")
+                        status["notified"].append({"id": race_id, "jcd": jcd, "rno": rno, "date": today, "combo": combo, "checked": False})
+                        venue_updated = True
+                except: continue
             
-        venue_updated = False
-        for rno in range(1, 13):
-            race_id = f"{today}_{str(jcd).zfill(2)}_{rno}"
-            if any(n['id'] == race_id for n in status["notified"]): continue
+            if venue_updated:
+                save_status(status)
+                push_status_to_github()
 
-            try:
-                raw_data = scrape_race_data(session, jcd, rno, today)
-                if raw_data is None: continue
+    if updated:
+        push_status_to_github()
 
-                df = pd.DataFrame([raw_data])
-                df = engineer_features(df)
-                probs = bst.predict(df[['jcd', 'rno', 'wind', 'wr_1_vs_avg'] + [f'wr{i}' for i in range(1,7)] + [f'st{i}' for i in range(1,7)] + [f'ex{i}' for i in range(1,7)] + [f'power_idx_{i}' for i in range(1,7)] + [f'st_gap_{i}_{i+1}' for i in range(1,6)] + [f'wr_gap_{i}_{i+1}' for i in range(1,6)]])[0]
-                
-                win_probs = calculate_tansho_probs(probs)
-                best_boat = max(win_probs, key=win_probs.get)
-                best_idx = np.argmax(probs)
-                combo, prob = COMBOS[best_idx], probs[best_idx]
-                
-                if prob > 0.4 or win_probs[best_boat] > 0.6:
-                    place = PLACE_NAMES.get(jcd, "会場")
-                    try:
-                        res_gemini = model_gemini.generate_content(f"{place}{rno}R。単勝{best_boat}({win_probs[best_boat]:.0%})、二連単{combo}({prob:.0%})。推奨理由を一言。").text
-                    except: res_gemini = "Gemini応答なし"
-
-                    discord.post(content=f"🚀 **勝負レース!** {place}{rno}R\n🛶 単勝:{best_boat}艇({win_probs[best_boat]:.0%})\n🔥 二連単:{combo}({prob:.0%})\n🤖 {res_gemini}\n[出走表](https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={today})")
-                    status["notified"].append({"id": race_id, "jcd": jcd, "rno": rno, "date": today, "combo": combo, "checked": False})
-                    venue_updated = True
-            except: continue
-        
-        if venue_updated:
-            save_status(status)
-            push_status_to_github() # 会場ごとに進捗保存
-
-    save_status(status)
     print("✅ 巡回終了")
 
 if __name__ == "__main__":
