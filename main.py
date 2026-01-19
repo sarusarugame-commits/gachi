@@ -20,6 +20,13 @@ from scraper import scrape_race_data, scrape_result
 # ==========================================
 BET_AMOUNT = 1000
 DB_FILE = "race_data.db"
+REPORT_HOURS = [13, 18, 23]
+
+# ★【厳選設定】自信度の足切りライン
+# ここを上げると通知が減り、下げると増えます
+THRESHOLD_NIRENTAN = 0.50  # 2連単の確率が50%以上なら通知
+THRESHOLD_TANSHO   = 0.75  # 1着の確率が75%以上なら通知
+
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model_gemini = genai.GenerativeModel('gemini-1.5-flash')
 discord = Discord(url=os.environ["DISCORD_WEBHOOK_URL"])
@@ -33,7 +40,6 @@ PLACE_NAMES = {
     13: "尼崎", 14: "鳴門", 15: "丸亀", 16: "児島", 17: "宮島", 18: "徳山",
     19: "下関", 20: "若松", 21: "芦屋", 22: "福岡", 23: "唐津", 24: "大村"
 }
-REPORT_HOURS = [13, 18, 23]
 
 # ★ 日本時間(JST)設定
 t_delta = datetime.timedelta(hours=9)
@@ -151,21 +157,15 @@ def calculate_tansho_probs(probs):
     return win_probs
 
 def check_deadline(deadline_str, now_dt):
-    """
-    締切時刻を過ぎていないかチェックする関数
-    True: まだ間に合う / False: もう終わってる
-    """
+    """締切時刻チェック"""
     try:
         if not deadline_str: return False
-        # 今日の日付と、スクレイピングした時刻(HH:MM)を結合
         hm = deadline_str.split(":")
         deadline_dt = now_dt.replace(hour=int(hm[0]), minute=int(hm[1]), second=0, microsecond=0)
-        
-        # 締切まであと「5分」を切っていたら、もうスキップする（安全策）
+        # 締切5分前を切っていたらスキップ
         limit = deadline_dt - datetime.timedelta(minutes=5)
         return now_dt < limit
-    except:
-        return True # 判定できない場合は念のためチェックする
+    except: return True
 
 def send_daily_report(current_hour):
     total, wins, today_profit = get_today_summary_from_db()
@@ -188,7 +188,7 @@ def main():
     today = now.strftime('%Y%m%d')
     current_hour = now.hour
     
-    print(f"🚀 Bot起動: {now.strftime('%H:%M')} (ラウンド巡回＆時間判定)")
+    print(f"🚀 Bot起動: {now.strftime('%H:%M')} (厳選モード)")
     
     if current_hour == 23 and now.minute > 15:
         print("💤 業務終了時刻です")
@@ -212,7 +212,7 @@ def main():
     try: bst = lgb.Booster(model_file=MODEL_FILE)
     except: return
 
-    # --- 1. 結果確認 (これは会場ループでOK) ---
+    # --- 1. 結果確認 ---
     print("📊 結果確認中...")
     updated = False
     for item in status["notified"]:
@@ -242,15 +242,10 @@ def main():
         save_status(status)
         push_data_to_github()
 
-    # --- 3. 新規予想 (ここが大改革！) ---
+    # --- 3. 新規予想 (厳選モード) ---
     if current_hour < 22:
         print("🔍 ラウンド順にパトロール中...")
-        
-        # ★大改革: ラウンド(1R〜12R)を外側のループにする
-        # これで「全会場の1R」→「全会場の2R」の順に見る
         for rno in range(1, 13):
-            
-            # タイムアウト対策
             if time.time() - start_time > 3000: break
             venue_updated = False
             
@@ -259,17 +254,12 @@ def main():
                 if any(n['id'] == race_id for n in status["notified"]): continue
 
                 try:
-                    # データ取得
                     raw_data = scrape_race_data(session, jcd, rno, today)
                     if raw_data is None: continue
 
-                    # ★時間チェック: 締切を過ぎていたらスキップ
                     deadline = raw_data.get('deadline_time')
-                    if not check_deadline(deadline, now):
-                        # print(f"SKIP: {jcd}場{rno}R (締切 {deadline} 経過済)")
-                        continue
+                    if not check_deadline(deadline, now): continue
 
-                    # ここまで来たら「まだ間に合うレース」
                     df = pd.DataFrame([raw_data])
                     df = engineer_features(df)
                     cols = ['jcd', 'rno', 'wind', 'wr_1_vs_avg']
@@ -282,28 +272,27 @@ def main():
                     best_idx = np.argmax(probs)
                     combo, prob = COMBOS[best_idx], probs[best_idx]
 
-                    if prob > 0.4 or win_probs[best_boat] > 0.6:
+                    # ★ 厳選フィルター
+                    # 2連単が50%以上 OR 単勝が75%以上
+                    if prob >= THRESHOLD_NIRENTAN or win_probs[best_boat] >= THRESHOLD_TANSHO:
                         place = PLACE_NAMES.get(jcd, "会場")
                         try:
                             prompt = f"{place}{rno}R。単勝{best_boat}({win_probs[best_boat]:.0%})、二連単{combo}({prob:.0%})。推奨理由を一言。"
                             res_gemini = model_gemini.generate_content(prompt).text
                         except: res_gemini = "Gemini応答なし"
 
-                        msg = (f"🚀 **勝負レース!** {place}{rno}R (締切 {deadline})\n"
+                        msg = (f"🔥 **超・勝負レース!** {place}{rno}R (締切 {deadline})\n"
                                f"🛶 単勝:{best_boat}艇({win_probs[best_boat]:.0%})\n"
-                               f"🔥 二連単:{combo}({prob:.0%})\n"
+                               f"🎯 二連単:{combo}({prob:.0%})\n"
                                f"🤖 {res_gemini}\n"
                                f"[出走表](https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={today})")
                         discord.post(content=msg)
                         log_prediction_to_db(race_id, jcd, rno, today, combo, prob, res_gemini)
                         status["notified"].append({"id": race_id, "jcd": jcd, "rno": rno, "date": today, "combo": combo, "checked": False})
                         venue_updated = True
-                        time.sleep(1) # 連投防止
-                except Exception as e:
-                    # print(f"Err {race_id}: {e}")
-                    continue
+                        time.sleep(1)
+                except: continue
             
-            # ラウンドごとに保存する
             if venue_updated:
                 save_status(status)
                 push_data_to_github()
