@@ -222,6 +222,54 @@
             "date": "20260120",
             "combo": "1-3",
             "checked": false
+        },
+        {
+            "id": "20260120_02_7",
+            "jcd": 2,
+            "rno": 7,
+            "date": "20260120",
+            "combo": "1-3",
+            "checked": false
+        },
+        {
+            "id": "20260120_06_7",
+            "jcd": 6,
+            "rno": 7,
+            "date": "20260120",
+            "combo": "4-3",
+            "checked": false
+        },
+        {
+            "id": "20260120_08_7",
+            "jcd": 8,
+            "rno": 7,
+            "date": "20260120",
+            "combo": "1-3",
+            "checked": false
+        },
+        {
+            "id": "20260120_13_7",
+            "jcd": 13,
+            "rno": 7,
+            "date": "20260120",
+            "combo": "1-4",
+            "checked": false
+        },
+        {
+            "id": "20260120_18_7",
+            "jcd": 18,
+            "rno": 7,
+            "date": "20260120",
+            "combo": "1-4",
+            "checked": false
+        },
+        {
+            "id": "20260120_20_7",
+            "jcd": 20,
+            "rno": 7,
+            "date": "20260120",
+            "combo": "1-3",
+            "checked": false
         }
     ],
     "results": [],
