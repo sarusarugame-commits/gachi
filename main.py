@@ -10,7 +10,7 @@ import zipfile
 import requests
 import subprocess
 import sqlite3
-from discordwebhook import Discord
+# from discordwebhook import Discord # ←削除（requestsで直接送ります）
 
 # スクレイピング機能
 from scraper import scrape_race_data, scrape_result
@@ -22,13 +22,20 @@ BET_AMOUNT = 1000
 DB_FILE = "race_data.db"
 REPORT_HOURS = [13, 18, 23]
 
-# ★【厳選設定】自信度の足切りライン
-THRESHOLD_NIRENTAN = 0.50  # 2連単 50%以上
-THRESHOLD_TANSHO   = 0.75  # 単勝 75%以上
+# ★【緩和設定】とりあえず通知が来るか確認するため下げます
+THRESHOLD_NIRENTAN = 0.40  # 40%以上なら通知
+THRESHOLD_TANSHO   = 0.50  # 50%以上なら通知
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model_gemini = genai.GenerativeModel('gemini-1.5-flash')
-discord = Discord(url=os.environ["DISCORD_WEBHOOK_URL"])
+
+# ★ Discord送信関数 (ライブラリを使わず直接叩く)
+def send_discord(content):
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url: return
+    try:
+        requests.post(url, json={"content": content})
+    except: pass
 
 MODEL_FILE = 'boat_model_nirentan.txt'
 ZIP_MODEL = 'model.zip'
@@ -156,12 +163,10 @@ def calculate_tansho_probs(probs):
     return win_probs
 
 def check_deadline(deadline_str, now_dt):
-    """締切時刻チェック"""
     try:
         if not deadline_str: return False
         hm = deadline_str.split(":")
         deadline_dt = now_dt.replace(hour=int(hm[0]), minute=int(hm[1]), second=0, microsecond=0)
-        # 締切5分前を切っていたらスキップ
         limit = deadline_dt - datetime.timedelta(minutes=5)
         return now_dt < limit
     except: return True
@@ -169,17 +174,23 @@ def check_deadline(deadline_str, now_dt):
 def send_daily_report(current_hour):
     total, wins, today_profit = get_today_summary_from_db()
     total_balance = get_total_balance_from_db()
-    if total == 0 and current_hour != 23: return
-
-    win_rate = (wins / total * 100) if total > 0 else 0
+    
+    win_rate = (wins / total * 100) if total > 0 else 0.0
     emoji = "🌞" if current_hour == 13 else ("🌇" if current_hour == 18 else "🌙")
     
-    msg = (f"{emoji} **{current_hour}時の収支報告**\n━━━━━━━━━━━━━━\n"
-           f"📅 本日戦績: {wins}勝 {total - wins}敗\n"
-           f"🎯 的中率: {win_rate:.1f}%\n"
-           f"💵 **本日: {'+' if today_profit > 0 else ''}{today_profit}円**\n"
-           f"💰 通算: {total_balance}円\n━━━━━━━━━━━━━━")
-    discord.post(content=msg)
+    if total == 0:
+        msg = (f"{emoji} **{current_hour}時の定期報告**\n━━━━━━━━━━━━━━\n"
+               f"💤 現在の勝負レース: なし\n"
+               f"💰 通算: {total_balance}円\n"
+               f"（現在、自信度40%以上で監視中）\n━━━━━━━━━━━━━━")
+    else:
+        msg = (f"{emoji} **{current_hour}時の収支報告**\n━━━━━━━━━━━━━━\n"
+               f"📅 本日戦績: {wins}勝 {total - wins}敗\n"
+               f"🎯 的中率: {win_rate:.1f}%\n"
+               f"💵 **本日: {'+' if today_profit > 0 else ''}{today_profit}円**\n"
+               f"💰 通算: {total_balance}円\n━━━━━━━━━━━━━━")
+    
+    send_discord(msg)
 
 def main():
     start_time = time.time()
@@ -187,31 +198,13 @@ def main():
     today = now.strftime('%Y%m%d')
     current_hour = now.hour
     
-    print(f"🚀 Bot起動: {now.strftime('%H:%M')} (厳選モード)")
+    print(f"🚀 Bot起動: {now.strftime('%H:%M')}")
+    # ★起動確認メッセージ（うるさい場合は後で消してください）
+    # send_discord(f"🚀 Botが起動しました ({now.strftime('%H:%M')})")
     
-    if current_hour == 23 and now.minute > 15:
-        print("💤 業務終了時刻です")
-        return
-
     init_db()
     session = requests.Session()
     status = load_status()
-
-    # モデル読み込み (★ここを修正しました)
-    if not os.path.exists(MODEL_FILE):
-        if os.path.exists(ZIP_MODEL):
-            with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
-        elif os.path.exists('model_part_1'):
-            with open(ZIP_MODEL, 'wb') as f_out:
-                for i in range(1, 10):
-                    p = f'model_part_{i}'
-                    if os.path.exists(p):
-                        with open(p, 'rb') as f_in:
-                            f_out.write(f_in.read())
-            with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
-
-    try: bst = lgb.Booster(model_file=MODEL_FILE)
-    except: return
 
     # --- 1. 結果確認 ---
     print("📊 結果確認中...")
@@ -229,7 +222,7 @@ def main():
             updated = True
             total_balance = get_total_balance_from_db()
             place = PLACE_NAMES.get(item["jcd"], "会場")
-            discord.post(content=f"{'🎊 的中' if is_win else '💀 外れ'} {place}{item['rno']}R\n予測:{item['combo']}→結果:{res['combo']}\n収支:{'+' if profit>0 else ''}{profit}円\n通算:{total_balance}円")
+            send_discord(f"{'🎊 的中' if is_win else '💀 外れ'} {place}{item['rno']}R\n予測:{item['combo']}→結果:{res['combo']}\n収支:{'+' if profit>0 else ''}{profit}円\n通算:{total_balance}円")
     
     if updated:
         save_status(status)
@@ -238,14 +231,34 @@ def main():
     # --- 2. 定期報告 ---
     report_key = f"{today}_{current_hour}"
     if current_hour in REPORT_HOURS and status.get("last_report") != report_key:
+        print(f"📢 {current_hour}時の報告を送信します")
         send_daily_report(current_hour)
         status["last_report"] = report_key
         save_status(status)
         push_data_to_github()
 
-    # --- 3. 新規予想 (厳選モード) ---
+    # --- 3. 新規予想 ---
+    if current_hour == 23 and now.minute > 15:
+        print("💤 深夜のため終了")
+        return
+
+    # モデル読み込み
+    if not os.path.exists(MODEL_FILE):
+        if os.path.exists(ZIP_MODEL):
+            with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
+        elif os.path.exists('model_part_1'):
+            with open(ZIP_MODEL, 'wb') as f_out:
+                for i in range(1, 10):
+                    p = f'model_part_{i}'
+                    if os.path.exists(p):
+                        with open(p, 'rb') as f_in: f_out.write(f_in.read())
+            with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
+
+    try: bst = lgb.Booster(model_file=MODEL_FILE)
+    except: return
+
     if current_hour < 22:
-        print("🔍 ラウンド順にパトロール中...")
+        print("🔍 パトロール中...")
         for rno in range(1, 13):
             if time.time() - start_time > 3000: break
             venue_updated = False
@@ -273,7 +286,7 @@ def main():
                     best_idx = np.argmax(probs)
                     combo, prob = COMBOS[best_idx], probs[best_idx]
 
-                    # 厳選フィルター
+                    # ★緩和されたフィルター
                     if prob >= THRESHOLD_NIRENTAN or win_probs[best_boat] >= THRESHOLD_TANSHO:
                         place = PLACE_NAMES.get(jcd, "会場")
                         try:
@@ -281,12 +294,14 @@ def main():
                             res_gemini = model_gemini.generate_content(prompt).text
                         except: res_gemini = "Gemini応答なし"
 
-                        msg = (f"🔥 **超・勝負レース!** {place}{rno}R (締切 {deadline})\n"
+                        msg = (f"🔥 **チャンス到来!** {place}{rno}R (締切 {deadline})\n"
                                f"🛶 単勝:{best_boat}艇({win_probs[best_boat]:.0%})\n"
                                f"🎯 二連単:{combo}({prob:.0%})\n"
                                f"🤖 {res_gemini}\n"
                                f"[出走表](https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={today})")
-                        discord.post(content=msg)
+                        
+                        send_discord(msg)
+                        
                         log_prediction_to_db(race_id, jcd, rno, today, combo, prob, res_gemini)
                         status["notified"].append({"id": race_id, "jcd": jcd, "rno": rno, "date": today, "combo": combo, "checked": False})
                         venue_updated = True
