@@ -5,7 +5,7 @@ import time
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-import google.generativeai as genai
+# import google.generativeai as genai  ←削除（ライブラリ不要）
 import zipfile
 import requests
 import subprocess
@@ -21,20 +21,9 @@ BET_AMOUNT = 1000
 DB_FILE = "race_data.db"
 REPORT_HOURS = [13, 18, 23]
 
-# ★【厳選設定】とりあえず緩めで様子見
-THRESHOLD_NIRENTAN = 0.40
-THRESHOLD_TANSHO   = 0.50
-
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model_gemini = genai.GenerativeModel('gemini-1.5-flash')
-
-# Discord送信
-def send_discord(content):
-    url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not url: return
-    try:
-        requests.post(url, json={"content": content})
-    except: pass
+# ★【厳選設定】
+THRESHOLD_NIRENTAN = 0.50  # 2連単 50%以上
+THRESHOLD_TANSHO   = 0.75  # 単勝 75%以上
 
 MODEL_FILE = 'boat_model_nirentan.txt'
 ZIP_MODEL = 'model.zip'
@@ -49,6 +38,41 @@ PLACE_NAMES = {
 # 日本時間設定
 t_delta = datetime.timedelta(hours=9)
 JST = datetime.timezone(t_delta, 'JST')
+
+# ==========================================
+# 🤖 Gemini API 直接呼び出し関数
+# ==========================================
+def call_gemini_api(prompt):
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return "APIキー未設定"
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    headers = {'Content-Type': 'application/json'}
+    data = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        if response.status_code == 200:
+            return response.json()['candidates'][0]['content']['parts'][0]['text']
+        else:
+            print(f"⚠️ Gemini API Error: {response.status_code} {response.text}")
+            return f"Geminiエラー({response.status_code})"
+    except Exception as e:
+        print(f"⚠️ Gemini通信失敗: {e}")
+        return "Gemini応答なし"
+
+# Discord送信
+def send_discord(content):
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url: return
+    try:
+        requests.post(url, json={"content": content})
+    except: pass
 
 # ==========================================
 # 🗄️ データベース管理
@@ -141,9 +165,7 @@ def push_data_to_github():
         subprocess.run('git commit -m "Update Data from Bot"', shell=True)
         subprocess.run('git pull origin main --rebase', shell=True)
         subprocess.run('git push origin main', shell=True)
-        print("💾 データ保存完了")
-    except Exception as e:
-        print(f"⚠️ 保存失敗: {e}")
+    except Exception as e: pass
 
 def engineer_features(df):
     for i in range(1, 7):
@@ -164,15 +186,10 @@ def calculate_tansho_probs(probs):
     return win_probs
 
 def check_deadline(deadline_str, now_dt):
-    """締切時刻チェック（時刻取得失敗時は 23:59 とみなして許可）"""
     try:
-        if not deadline_str: return True # 時刻不明なら許可
-        if deadline_str == "23:59": return True
-        
+        if not deadline_str: return True
         hm = deadline_str.split(":")
         deadline_dt = now_dt.replace(hour=int(hm[0]), minute=int(hm[1]), second=0, microsecond=0)
-        
-        # 締切5分前を切っていたらスキップ
         limit = deadline_dt - datetime.timedelta(minutes=5)
         return now_dt < limit
     except: return True
@@ -184,17 +201,11 @@ def send_daily_report(current_hour):
     win_rate = (wins / total * 100) if total > 0 else 0.0
     emoji = "🌞" if current_hour == 13 else ("🌇" if current_hour == 18 else "🌙")
     
-    if total == 0:
-        msg = (f"{emoji} **{current_hour}時の定期報告**\n━━━━━━━━━━━━━━\n"
-               f"💤 現在の勝負レース: なし\n"
-               f"💰 通算: {total_balance}円\n"
-               f"（現在、自信度40%以上で監視中）\n━━━━━━━━━━━━━━")
-    else:
-        msg = (f"{emoji} **{current_hour}時の収支報告**\n━━━━━━━━━━━━━━\n"
-               f"📅 本日戦績: {wins}勝 {total - wins}敗\n"
-               f"🎯 的中率: {win_rate:.1f}%\n"
-               f"💵 **本日: {'+' if today_profit > 0 else ''}{today_profit}円**\n"
-               f"💰 通算: {total_balance}円\n━━━━━━━━━━━━━━")
+    msg = (f"{emoji} **{current_hour}時の収支報告**\n━━━━━━━━━━━━━━\n"
+            f"📅 本日戦績: {wins}勝 {total - wins}敗\n"
+            f"🎯 的中率: {win_rate:.1f}%\n"
+            f"💵 **本日: {'+' if today_profit > 0 else ''}{today_profit}円**\n"
+            f"💰 通算: {total_balance}円\n━━━━━━━━━━━━━━")
     
     send_discord(msg)
 
@@ -205,7 +216,6 @@ def main():
     current_hour = now.hour
     
     print(f"🚀 Bot起動: {now.strftime('%H:%M')}")
-    # ★起動通知は削除しました
     
     init_db()
     session = requests.Session()
@@ -233,10 +243,8 @@ def main():
         save_status(status)
         push_data_to_github()
 
-    # --- 2. 定期報告 (重複防止強化版) ---
+    # --- 2. 定期報告 ---
     report_key = f"{today}_{current_hour}"
-    # ★追加: 「現在時刻の分が 30未満」のときだけ報告する。
-    # これにより、X時30分の実行回では絶対に報告が送られなくなる。
     if now.minute < 30 and current_hour in REPORT_HOURS and status.get("last_report") != report_key:
         print(f"📢 {current_hour}時の報告を送信します")
         send_daily_report(current_hour)
@@ -249,7 +257,6 @@ def main():
         print("💤 深夜のため終了")
         return
 
-    # モデル準備
     if not os.path.exists(MODEL_FILE):
         if os.path.exists(ZIP_MODEL):
             with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
@@ -295,19 +302,19 @@ def main():
 
                     if prob >= THRESHOLD_NIRENTAN or win_probs[best_boat] >= THRESHOLD_TANSHO:
                         place = PLACE_NAMES.get(jcd, "会場")
-                        try:
-                            prompt = f"{place}{rno}R。単勝{best_boat}({win_probs[best_boat]:.0%})、二連単{combo}({prob:.0%})。推奨理由を一言。"
-                            res_gemini = model_gemini.generate_content(prompt).text
-                        except: res_gemini = "Gemini応答なし"
+                        
+                        # ★ここでAPIを直接叩く
+                        prompt = f"{place}{rno}R。単勝{best_boat}({win_probs[best_boat]:.0%})、二連単{combo}({prob:.0%})。推奨理由を一言。"
+                        res_gemini = call_gemini_api(prompt)
 
-                        msg = (f"🔥 **チャンス到来!** {place}{rno}R (締切 {deadline})\n"
+                        time_display = f"(締切 {deadline})" if deadline else ""
+                        msg = (f"🔥 **勝負レース到来!** {place}{rno}R {time_display}\n"
                                f"🛶 単勝:{best_boat}艇({win_probs[best_boat]:.0%})\n"
                                f"🎯 二連単:{combo}({prob:.0%})\n"
                                f"🤖 {res_gemini}\n"
                                f"[出走表](https://www.boatrace.jp/owpc/pc/race/racelist?rno={rno}&jcd={jcd:02d}&hd={today})")
                         
                         send_discord(msg)
-                        
                         log_prediction_to_db(race_id, jcd, rno, today, combo, prob, res_gemini)
                         status["notified"].append({"id": race_id, "jcd": jcd, "rno": rno, "date": today, "combo": combo, "checked": False})
                         venue_updated = True
