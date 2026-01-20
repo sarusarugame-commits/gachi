@@ -550,6 +550,14 @@
             "date": "20260120",
             "combo": "1-3",
             "checked": false
+        },
+        {
+            "id": "20260120_06_9",
+            "jcd": 6,
+            "rno": 9,
+            "date": "20260120",
+            "combo": "1-3",
+            "checked": false
         }
     ],
     "results": [],
