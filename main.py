@@ -9,7 +9,8 @@ import requests
 import subprocess
 import sqlite3
 import concurrent.futures
-import zipfile  # ★前回忘れていたライブラリを追加しました
+import zipfile
+import traceback # エラー詳細表示用
 
 # スクレイピング機能
 from scraper import scrape_race_data, scrape_result
@@ -17,13 +18,14 @@ from scraper import scrape_race_data, scrape_result
 # ==========================================
 # ⚙️ 設定エリア
 # ==========================================
-BET_AMOUNT = 1000  # 1レースあたりのシミュレーション購入額
+BET_AMOUNT = 1000
 DB_FILE = "race_data.db"
 REPORT_HOURS = [13, 18, 23]
 
+# ★ユーザー指定により閾値は維持
 THRESHOLD_NIRENTAN = 0.50
 THRESHOLD_TANSHO   = 0.75
-GEMINI_MODEL_NAME = "gemini-3-flash-preview"
+GEMINI_MODEL_NAME = "gemini-3-flash-preview" 
 
 MODEL_FILE = 'boat_model_nirentan.txt'
 ZIP_MODEL = 'model.zip'
@@ -49,15 +51,26 @@ def call_gemini_api(prompt):
     data = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         res = requests.post(url, headers=headers, json=data, timeout=10)
-        if res.status_code == 200: return res.json()['candidates'][0]['content']['parts'][0]['text']
-        return f"エラー({res.status_code})"
-    except: return "応答なし"
+        if res.status_code == 200:
+            return res.json()['candidates'][0]['content']['parts'][0]['text']
+        else:
+            print(f"Gemini Error: {res.status_code} {res.text}")
+            return f"エラー({res.status_code})"
+    except Exception as e:
+        print(f"Gemini Exception: {e}")
+        return "応答なし"
 
 def send_discord(content):
     url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not url: return
-    try: requests.post(url, json={"content": content})
-    except: pass
+    if not url:
+        print("⚠️ Discord Webhook URLが設定されていません")
+        return
+    try:
+        res = requests.post(url, json={"content": content}, timeout=10)
+        if res.status_code not in [200, 204]:
+            print(f"❌ Discord送信失敗: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"❌ Discord送信エラー: {e}")
 
 # ==========================================
 # 🗄️ DB & Git
@@ -86,14 +99,12 @@ def save_and_notify(new_predictions, updated_results):
                 (res['result_combo'], is_win, res['payout'], profit, "FINISHED", res['race_id']))
             place = PLACE_NAMES.get(res['jcd'], "会場")
             
-            # 的中/不的中の通知
             send_discord(f"{'🎊 的中' if is_win else '💀 外れ'} {place}{res['rno']}R\n予測:{res['predict_combo']}→結果:{res['result_combo']}\n収支:{'+' if profit>0 else ''}{profit}円")
 
         # 新規予想通知
         for pred in new_predictions:
             now_str = datetime.datetime.now(JST).strftime('%H:%M:%S')
             place = PLACE_NAMES.get(pred['jcd'], "不明")
-            # ステータス PENDING = 予想済み（結果待ち）
             c.execute("INSERT OR IGNORE INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pred['id'], pred['date'], now_str, place, pred['rno'], pred['combo'], float(pred['prob']), pred['comment'], "PENDING", "", 0, 0, 0))
             
@@ -104,8 +115,11 @@ def save_and_notify(new_predictions, updated_results):
                    f"🤖 {pred['comment']}\n"
                    f"[出走表](https://www.boatrace.jp/owpc/pc/race/racelist?rno={pred['rno']}&jcd={pred['jcd']:02d}&hd={pred['date']})")
             send_discord(msg)
+            print(f"✅ 通知送信: {place}{pred['rno']}R") # ログ確認用
         conn.commit()
-    except: pass
+    except Exception as e:
+        print(f"DB Error: {e}")
+        traceback.print_exc()
     finally: conn.close()
 
 def push_data():
@@ -116,7 +130,8 @@ def push_data():
         subprocess.run('git commit -m "Update"', shell=True)
         subprocess.run('git pull origin main --rebase', shell=True)
         subprocess.run('git push origin main', shell=True)
-    except: pass
+    except Exception as e:
+        print(f"Git Error: {e}")
 
 def engineer_features(df):
     for i in range(1, 7): df[f'power_idx_{i}'] = df[f'wr{i}'] * (1.0 / (df[f'st{i}'] + 0.01))
@@ -135,13 +150,25 @@ def calculate_tansho(probs):
 
 def is_target_race(deadline_str, now_dt):
     try:
-        if not deadline_str: return True
+        # ★修正: 締切時刻取得失敗（Noneまたは"23:59"）の場合は、強制的に対象とする
+        if not deadline_str or deadline_str == "23:59":
+            return True
+
         hm = deadline_str.split(":")
         d_dt = now_dt.replace(hour=int(hm[0]), minute=int(hm[1]), second=0)
-        if d_dt < now_dt - datetime.timedelta(hours=1): d_dt += datetime.timedelta(days=1)
+        
+        # 日またぎ対応（例：現在23:30で締切が00:10の場合など）
+        if d_dt < now_dt - datetime.timedelta(hours=1):
+             d_dt += datetime.timedelta(days=1)
+        
+        # 締切過ぎてたら除外
         if now_dt > d_dt: return False
+        
+        # 40分以内なら対象
         return (d_dt - now_dt) <= datetime.timedelta(minutes=40)
-    except: return True
+    except:
+        # エラーが出たら念のためTrueにしておく
+        return True
 
 def process_venue(jcd, today, notified, bst):
     res_list, pred_list = [], []
@@ -150,11 +177,14 @@ def process_venue(jcd, today, notified, bst):
     # 1. 結果確認 (未確認のものがあれば)
     pending_items = [i for i in notified if i['jcd'] == jcd and not i['checked']]
     for item in pending_items:
-        r = scrape_result(sess, item["jcd"], item["rno"], item["date"])
-        if r:
-            item['checked'] = True
-            res_list.append({'race_id': item['id'], 'jcd': item['jcd'], 'rno': item['rno'], 
-                             'predict_combo': item['combo'], 'result_combo': r['combo'], 'payout': r['payout']})
+        try:
+            r = scrape_result(sess, item["jcd"], item["rno"], item["date"])
+            if r:
+                item['checked'] = True
+                res_list.append({'race_id': item['id'], 'jcd': item['jcd'], 'rno': item['rno'], 
+                                 'predict_combo': item['combo'], 'result_combo': r['combo'], 'payout': r['payout']})
+        except Exception as e:
+            print(f"Result Scrape Error (JCD{jcd}): {e}")
 
     # 2. 新規予想
     now = datetime.datetime.now(JST)
@@ -163,7 +193,12 @@ def process_venue(jcd, today, notified, bst):
         if any(n['id'] == rid for n in notified): continue
         try:
             raw = scrape_race_data(sess, jcd, rno, today)
-            if not raw or not is_target_race(raw.get('deadline_time'), now): continue
+            # スクレイピング失敗時は raw が None
+            if not raw: continue 
+            
+            # ★ここで時刻判定
+            if not is_target_race(raw.get('deadline_time'), now):
+                continue
             
             df = engineer_features(pd.DataFrame([raw]))
             cols = ['jcd', 'rno', 'wind', 'wr_1_vs_avg']
@@ -176,6 +211,9 @@ def process_venue(jcd, today, notified, bst):
             best_idx = np.argmax(probs)
             combo, prob = COMBOS[best_idx], probs[best_idx]
 
+            # デバッグ用（閾値を超えたかログに出す）
+            # if prob > 0.1: print(f"Check {jcd}-{rno}R: {combo} {prob:.2f}")
+
             if prob >= THRESHOLD_NIRENTAN or win_p[best_b] >= THRESHOLD_TANSHO:
                 place = PLACE_NAMES.get(jcd, "会場")
                 prompt = f"{place}{rno}R。単勝{best_b}({win_p[best_b]:.0%})、二連単{combo}({prob:.0%})。推奨理由を一言。"
@@ -183,7 +221,9 @@ def process_venue(jcd, today, notified, bst):
                 pred_list.append({'id': rid, 'jcd': jcd, 'rno': rno, 'date': today, 'combo': combo, 
                                   'prob': prob, 'best_boat': best_b, 'win_prob': win_p[best_b], 
                                   'comment': comment, 'deadline': raw.get('deadline_time')})
-        except: continue
+        except Exception as e:
+            # print(f"Prediction Error ({jcd}-{rno}): {e}") # うるさい場合はコメントアウト
+            continue
     return res_list, pred_list
 
 def main():
@@ -204,8 +244,11 @@ def main():
                         with open(f'model_part_{i}', 'rb') as f_in: f_out.write(f_in.read())
             with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
     
-    try: bst = lgb.Booster(model_file=MODEL_FILE)
-    except: return
+    try: 
+        bst = lgb.Booster(model_file=MODEL_FILE)
+    except Exception as e:
+        print(f"🔥 モデル読み込み失敗: {e}")
+        return
 
     # ★ ループ開始 ★
     while True:
@@ -237,7 +280,8 @@ def main():
                     r, p = f.result()
                     all_res.extend(r)
                     all_pred.extend(p)
-                except: pass
+                except Exception as e:
+                    print(f"Thread Error: {e}")
         
         save_and_notify(all_pred, all_res)
 
@@ -257,22 +301,17 @@ def main():
         if now.hour in REPORT_HOURS and status.get("last_report") != report_key:
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
-            
-            # 完了したレース
             c.execute("SELECT count(*), sum(is_win), sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
             cnt, wins, profit = c.fetchone()
-            
-            # 結果待ちのレース (PENDING)
             c.execute("SELECT count(*) FROM history WHERE date=? AND status='PENDING'", (today,))
             pending_cnt = c.fetchone()[0]
             conn.close()
             
-            # 戦績、または待機中があれば報告する
             if cnt > 0 or pending_cnt > 0 or now.hour == 23:
                 msg = (f"**{now.hour}時の報告**\n"
                        f"✅ 完了:{cnt}R (勝:{wins})\n"
                        f"⏳ 予想中(待機):{pending_cnt}R\n"
-                       f"💵 収支(シミュレーション):{'+' if (profit or 0)>0 else ''}{profit or 0}円")
+                       f"💵 収支:{'+' if (profit or 0)>0 else ''}{profit or 0}円")
                 send_discord(msg)
                 status["last_report"] = report_key
                 updated = True
