@@ -265,7 +265,7 @@ def main():
         now = datetime.datetime.now(JST)
         today = now.strftime('%Y%m%d')
         
-        if now.hour >= 23:
+       if now.hour >= 23 and now.minute >= 10:
             print("🌙 業務終了")
             break
 
