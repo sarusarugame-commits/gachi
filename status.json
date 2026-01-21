@@ -630,6 +630,14 @@
             "date": "20260121",
             "combo": "1-3",
             "checked": false
+        },
+        {
+            "id": "20260121_18_7",
+            "jcd": 18,
+            "rno": 7,
+            "date": "20260121",
+            "combo": "1-3",
+            "checked": false
         }
     ],
     "results": [],
