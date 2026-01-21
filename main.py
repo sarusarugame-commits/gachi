@@ -22,12 +22,12 @@ BET_AMOUNT = 1000
 DB_FILE = "race_data.db"
 REPORT_HOURS = [13, 18, 23]
 
-# ★閾値設定（お好みの値でOK）
+# ★閾値設定
 THRESHOLD_NIRENTAN = 0.50
 THRESHOLD_TANSHO   = 0.75
 
-# ★モデル名修正: gemini-3 は存在しないため修正
-GEMINI_MODEL_NAME = "gemini-3-flash-preview" 
+# ★モデル名
+GEMINI_MODEL_NAME = "gemini-2.0-flash-exp" 
 
 MODEL_FILE = 'boat_model_nirentan.txt'
 ZIP_MODEL = 'model.zip'
@@ -151,29 +151,23 @@ def calculate_tansho(probs):
     for idx, c in enumerate(COMBOS): win[int(c.split('-')[0])] += probs[idx]
     return win
 
-# ★重要：40分以内判定ロジック（安全装置付き）
 def is_target_race(deadline_str, now_dt):
     try:
-        # 時刻取得失敗(None) または 解析失敗時の仮値("23:59") の場合、
-        # 「通知されないリスク」を避けるため、とりあえずTrue（対象）として扱う
         if not deadline_str or deadline_str == "23:59":
             return True
 
         hm = deadline_str.split(":")
         d_dt = now_dt.replace(hour=int(hm[0]), minute=int(hm[1]), second=0)
         
-        # 日付またぎ対応
         if d_dt < now_dt - datetime.timedelta(hours=1):
              d_dt += datetime.timedelta(days=1)
         
-        # 締切時刻を過ぎていたら除外
         if now_dt > d_dt: return False
         
-        # 「あと40分以内」なら対象
+        # 40分以内なら対象
         return (d_dt - now_dt) <= datetime.timedelta(minutes=40)
         
     except:
-        # エラー発生時は念のため対象にする
         return True
 
 def process_venue(jcd, today, notified, bst):
@@ -198,21 +192,18 @@ def process_venue(jcd, today, notified, bst):
         if any(n['id'] == rid for n in notified): continue
         
         try:
-            # データ取得
             raw = scrape_race_data(sess, jcd, rno, today)
             if not raw: continue 
             
-            # ★ここで「40分以内」を判定
+            # ★ここで40分以内判定
             if not is_target_race(raw.get('deadline_time'), now):
                 continue
             
-            # 特徴量エンジニアリング
             df = engineer_features(pd.DataFrame([raw]))
             cols = ['jcd', 'rno', 'wind', 'wr_1_vs_avg']
             for i in range(1, 7): cols.extend([f'wr{i}', f'st{i}', f'ex{i}', f'power_idx_{i}'])
             for i in range(1, 6): cols.extend([f'st_gap_{i}_{i+1}', f'wr_gap_{i}_{i+1}'])
             
-            # 予測
             probs = bst.predict(df[cols])[0]
             win_p = calculate_tansho(probs)
             best_b = max(win_p, key=win_p.get)
@@ -239,7 +230,7 @@ def main():
     start_time = time.time()
     MAX_RUNTIME = 6 * 3600
     
-    print("🚀 Bot起動 (40分以内限定モード)")
+    print("🚀 Bot起動")
     init_db()
     
     # モデル解凍
@@ -265,7 +256,8 @@ def main():
         now = datetime.datetime.now(JST)
         today = now.strftime('%Y%m%d')
         
-       if now.hour >= 23 and now.minute >= 10:
+        # ★修正済み: 23時報告を確実にするため23:10まで稼働
+        if now.hour >= 23 and now.minute >= 10:
             print("🌙 業務終了")
             break
 
