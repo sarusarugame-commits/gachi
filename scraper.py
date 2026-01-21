@@ -29,71 +29,47 @@ def get_soup(session, url):
     except: return None
 
 def scrape_race_data(session, jcd, rno, date_str):
-    """
-    レース情報を取得する
-    """
     base_url = "https://www.boatrace.jp/owpc/pc/race"
     url_list = f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_list = get_soup(session, url_list)
     if not soup_list: return None
 
-    # 出走表ページから締切時刻を取得（失敗時は仮値 "23:59" を入れるが、main.pyで処理する）
     body_text = clean_text(soup_list.text)
-    # 修正: スペースが入ってもマッチするように \s* を追加
+    # ★修正: 正規表現に \s* を追加してスペースに対応
     time_match = re.search(r"締切予定\s*(\d{1,2}:\d{2})", body_text)
     deadline_time = time_match.group(1) if time_match else "23:59"
 
-    # 直前情報の取得
     url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_before = get_soup(session, url_before)
     if not soup_before: return None
 
-    row = {
-        'date': date_str, 
-        'jcd': jcd, 
-        'rno': rno,
-        'deadline_time': deadline_time
-    }
+    row = {'date': date_str, 'jcd': jcd, 'rno': rno, 'deadline_time': deadline_time}
     
     try:
-        # --- データ取得 ---
         weather = soup_before.select(".weather1_bodyUnitLabelData")
         row['wind'] = next((extract_float(e.text) for e in weather if "m" in e.text and "cm" not in e.text), 0.0)
         
         for i in range(1, 7):
-            # 展示タイム
             try:
-                # 構造が変わってもある程度耐えられるように修正
-                target_row = soup_before.select_one(f".is-boatColor{i}")
-                if target_row:
-                    parent_tbody = target_row.find_parent("tbody")
-                    ex_val = parent_tbody.select("td")[4].text
-                    row[f'ex{i}'] = extract_float(ex_val)
-                else:
-                    row[f'ex{i}'] = 6.80
-            except:
-                row[f'ex{i}'] = 6.80
+                # 取得箇所が見つからなくてもエラーにしない
+                node = soup_before.select_one(f".is-boatColor{i}")
+                val = node.find_parent("tbody").select("td")[4].text if node else "6.80"
+                row[f'ex{i}'] = extract_float(val)
+            except: row[f'ex{i}'] = 6.80
 
-            # 本番データ
             try:
-                target_row = soup_list.select_one(f".is-boatColor{i}")
-                if target_row:
-                    tbody = target_row.find_parent("tbody")
-                    tds = tbody.select("td")
-                    
-                    row[f'wr{i}'] = extract_float(tds[3].text)
-                    row[f'f{i}'] = int(extract_float(tds[2].text))
-                    st_match = re.search(r"ST(\d\.\d{2})", clean_text(tbody.text))
-                    row[f'st{i}'] = float(st_match.group(1)) if st_match else 0.17
-                    row[f'mo{i}'] = extract_float(tds[5].text) or 30.0
-                else:
-                    return None # 選手データが取れない場合はスキップ
-            except:
-                return None
-
-    except:
-        return None 
-        
+                node_list = soup_list.select_one(f".is-boatColor{i}")
+                if not node_list: return None
+                tbody = node_list.find_parent("tbody")
+                tds = tbody.select("td")
+                
+                row[f'wr{i}'] = extract_float(tds[3].text)
+                row[f'f{i}'] = int(extract_float(tds[2].text))
+                st_match = re.search(r"ST(\d\.\d{2})", clean_text(tbody.text))
+                row[f'st{i}'] = float(st_match.group(1)) if st_match else 0.17
+                row[f'mo{i}'] = extract_float(tds[5].text) or 30.0
+            except: return None
+    except: return None
     return row
 
 def scrape_result(session, jcd, rno, date_str):
