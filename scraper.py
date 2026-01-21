@@ -28,35 +28,40 @@ def get_soup(session, url):
         return BeautifulSoup(res.text, 'html.parser') if res.status_code == 200 else None
     except: return None
 
-def get_deadline_time_accurately(soup):
+def get_deadline_time_accurately(soup, rno):
     """
-    HTML構造から「締切予定」の隣にある時刻を正確に抜き出す
+    HTML構造から、対象レース(rno)の締切時刻をピンポイントで抜く
     """
     try:
-        # 1. "締切予定" という文字を含む th または td タグを探す
-        target_tags = soup.find_all(['th', 'td'], string=re.compile("締切予定"))
+        # 1. "締切予定時刻" という文字を含むセルを探す
+        # HTML解析: <td ...>締切予定時刻</td> というタグが存在する
+        target_label = soup.find(lambda tag: tag.name in ['td', 'th'] and "締切予定時刻" in tag.text)
         
-        for tag in target_tags:
-            # そのタグの親(tr)内にある、次の要素などを探す
-            # パターンA: <th>締切予定</th><td>10:45</td> のような構造
-            next_sibling = tag.find_next_sibling(['td', 'th'])
-            if next_sibling:
-                text = clean_text(next_sibling.text)
-                match = re.search(r"(\d{1,2}:\d{2})", text)
-                if match:
-                    return match.group(1)
-        
-        # 2. 見つからなかった場合の予備（テキスト全体検索）
-        # ここは以前のロジックだが、念のため残す
-        text = clean_text(soup.text)
-        match = re.search(r"締切予定.*?(\d{1,2}:\d{2})", text)
-        if match:
-            return match.group(1)
+        if target_label:
+            # 2. その親の行(tr)を取得
+            parent_row = target_label.find_parent('tr')
+            
+            if parent_row:
+                # 3. その行の中にある全てのセル(td/th)を取得
+                cells = parent_row.find_all(['td', 'th'])
+                
+                # 解説: 
+                # cells[0] は「締切予定時刻」という見出しセル
+                # cells[1] は 1Rの時刻
+                # cells[2] は 2Rの時刻
+                # ...
+                # cells[rno] が そのレースの時刻 になる
+                
+                if len(cells) > rno:
+                    time_text = clean_text(cells[rno].text)
+                    match = re.search(r"(\d{1,2}:\d{2})", time_text)
+                    if match:
+                        return match.group(1)
 
     except Exception:
         pass
     
-    return None # 取得不能
+    return None
 
 def scrape_race_data(session, jcd, rno, date_str):
     base_url = "https://www.boatrace.jp/owpc/pc/race"
@@ -64,12 +69,12 @@ def scrape_race_data(session, jcd, rno, date_str):
     soup_list = get_soup(session, url_list)
     if not soup_list: return None
 
-    # ★修正点: 専用関数で正確に時刻を取得
-    deadline_time = get_deadline_time_accurately(soup_list)
+    # ★修正点: rno を渡して、そのレース番号の時刻を取得する
+    deadline_time = get_deadline_time_accurately(soup_list, rno)
     
-    # 取得できない場合はNoneを返す（main.py側で「Noneならとりあえず対象にする」処理が入っているため安全）
+    # 取得できない場合はNone (main.py側で処理)
     if not deadline_time:
-        deadline_time = "23:59" # 最終手段としての仮値
+        deadline_time = "23:59"
 
     url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_before = get_soup(session, url_before)
@@ -82,14 +87,12 @@ def scrape_race_data(session, jcd, rno, date_str):
         row['wind'] = next((extract_float(e.text) for e in weather if "m" in e.text and "cm" not in e.text), 0.0)
         
         for i in range(1, 7):
-            # 展示タイム
             try:
                 node = soup_before.select_one(f".is-boatColor{i}")
                 val = node.find_parent("tbody").select("td")[4].text if node else "6.80"
                 row[f'ex{i}'] = extract_float(val)
             except: row[f'ex{i}'] = 6.80
 
-            # 本番データ
             try:
                 node_list = soup_list.select_one(f".is-boatColor{i}")
                 if not node_list: return None
