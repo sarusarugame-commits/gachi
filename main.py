@@ -10,7 +10,7 @@ import concurrent.futures
 import zipfile
 import traceback
 
-# スクレイピング機能（scraper.pyが同階層にある前提）
+# スクレイピング機能
 from scraper import scrape_race_data
 
 # ==========================================
@@ -113,7 +113,6 @@ def is_target_race(deadline_str, now_dt):
         
         if now_dt > d_dt: return False
         
-        # 60分以内なら対象（広めに取る）
         return (d_dt - now_dt) <= datetime.timedelta(minutes=60)
     except: return True
 
@@ -130,7 +129,6 @@ def process_prediction(jcd, today, notified_ids, bst):
             raw = scrape_race_data(sess, jcd, rno, today)
             if not raw: continue 
             
-            # 時間判定
             if not is_target_race(raw.get('deadline_time'), now): continue
             
             df = engineer_features(pd.DataFrame([raw]))
@@ -147,8 +145,6 @@ def process_prediction(jcd, today, notified_ids, bst):
             if prob >= THRESHOLD_NIRENTAN or win_p[best_b] >= THRESHOLD_TANSHO:
                 place = PLACE_NAMES.get(jcd, "会場")
                 prompt = f"{place}{rno}R。単勝{best_b}({win_p[best_b]:.0%})、二連単{combo}({prob:.0%})。推奨理由を一言。"
-                
-                # Groq呼び出し
                 comment = call_groq_api(prompt)
                 
                 pred_list.append({
@@ -164,13 +160,38 @@ def main():
     print(f"🚀 [Main] 高速予想Bot起動 (Model: {GROQ_MODEL_NAME})")
     init_db()
     
+    # ★修正箇所：分割ファイルの結合ロジックを復活
     if not os.path.exists(MODEL_FILE):
+        # model.zip が無い場合、model_part_* を探して結合する
+        if not os.path.exists(ZIP_MODEL):
+            if os.path.exists('model_part_1') or os.path.exists('model_part_01'):
+                print("📦 分割モデルを結合中...")
+                with open(ZIP_MODEL, 'wb') as f_out:
+                    for i in range(1, 20): # 最大20分割まで想定
+                        # model_part_1 と model_part_01 の両パターンに対応
+                        part_name = f'model_part_{i}'
+                        if not os.path.exists(part_name):
+                             part_name = f'model_part_{i:02d}'
+                        
+                        if os.path.exists(part_name):
+                            with open(part_name, 'rb') as f_in: f_out.write(f_in.read())
+                        else:
+                            break # ファイルが途切れたら終了
+
+        # model.zip があれば解凍
         if os.path.exists(ZIP_MODEL):
+            print("📦 モデルを解凍中...")
             with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
+            print("✅ 解凍完了")
     
-    try: bst = lgb.Booster(model_file=MODEL_FILE)
+    try: 
+        bst = lgb.Booster(model_file=MODEL_FILE)
+        print("✅ モデル読み込み成功")
     except Exception as e:
         print(f"🔥 モデル読み込み失敗: {e}")
+        # GitHub Actionsでのデバッグ用にファイル一覧を表示
+        print("📂 現在のフォルダ構成:")
+        print(os.listdir('.'))
         return
 
     while True:
@@ -183,7 +204,6 @@ def main():
             print("🌙 業務終了")
             break
 
-        # 既に予想済みのIDを取得
         conn = sqlite3.connect(DB_FILE, timeout=30)
         c = conn.cursor()
         c.execute("SELECT race_id FROM history")
@@ -220,7 +240,6 @@ def main():
             conn.close()
 
         elapsed = time.time() - start_ts
-        # 3分待機
         sleep_time = max(0, 180 - elapsed)
         print(f"⏳ 待機: {int(sleep_time)}秒")
         time.sleep(sleep_time)
