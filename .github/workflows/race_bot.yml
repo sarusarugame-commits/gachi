@@ -1,37 +1,69 @@
-name: run-bot
+name: Boat Race Bot
 
 on:
   schedule:
-    # ⏰ JST 08:00, 14:00, 20:00 の3回だけ起動
-    # (UTCだと 23:00, 05:00, 11:00)
-    - cron: '0 23,5,11 * * *'
+    # ⏰ JST 08:30 (UTC 23:30) に起動
+    # ※6時間制限があるため、必要なら 14:30 (UTC 05:30) にも追加してください
+    - cron: '30 23 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  run-race-prediction:
+  run-race-bot:
     runs-on: ubuntu-latest
-    # 最大6時間稼働 (Python側で22時に強制終了するので深夜までは動きません)
+    # 最大6時間 (タイムアウト前に保存処理を行うため、余裕を持たせる)
     timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@v4
-      
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
-      
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy lightgbm requests beautifulsoup4
 
-      - name: Run Main Script
+      - name: Run Bots (Predict & Report)
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python main.py
+        run: |
+          # 1. 予想Botをバックグラウンドで起動
+          python main.py &
+          
+          # 2. 報告Botもバックグラウンドで起動
+          python report.py &
+          
+          # 3. 5時間50分 (21000秒) 待機して稼働させる
+          # ※GitHub Actionsの制限(6時間)が来る前に終了処理へ移るため
+          sleep 21000
+          
+          # 4. プロセスを終了させる
+          echo "🛑 Stopping bots..."
+          pkill -f python || true
+
+      - name: Commit and Push Database
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "bot@noreply.github.com"
+          
+          # データベースの変更があればコミット
+          git add race_data.db
+          
+          # 変更がない場合はエラー終了させずにスキップ
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update race data [skip ci]"
+            # 競合回避のためPullしてからPush
+            git pull origin main --rebase
+            git push origin main
+          fi
