@@ -42,76 +42,67 @@ def get_deadline_time_accurately(soup, rno):
     except Exception: pass
     return None
 
-# ★追加機能: リアルタイムオッズ取得
-def scrape_odds(session, jcd, rno, date_str):
+# ★修正: ターゲット（予測した買い目）のオッズをピンポイントで取得
+def scrape_odds(session, jcd, rno, date_str, target_boat=None, target_combo=None):
     """
-    単勝と2連単の主要オッズを取得してテキストで返す
+    指定された単勝・2連単オッズを取得する
+    target_boat: '1' など
+    target_combo: '1-2' など
     """
-    # 1. 単勝オッズ (oddstf)
-    url_tan = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    soup_tan = get_soup(session, url_tan)
-    tansho_text = "取得失敗"
-    
-    if soup_tan:
-        try:
-            # 単勝オッズを簡易抽出 (1号艇〜6号艇)
-            odds_list = []
-            tables = soup_tan.select("table")
-            for tbl in tables:
-                if "単勝" in str(tbl): # 単勝テーブルを探す
-                    rows = tbl.select("tr")
-                    for row in rows:
-                        tds = row.select("td")
-                        if len(tds) >= 3: # 艇番, 選手名, オッズ
-                            boat = clean_text(tds[0].text)
-                            val = clean_text(tds[2].text)
-                            if boat.isdigit():
-                                odds_list.append(f"{boat}号艇:{val}")
-                    break
-            if odds_list:
-                tansho_text = ", ".join(odds_list)
-        except: pass
+    result = {"tansho": "---", "nirentan": "---"}
 
-    # 2. 2連単オッズ (odds2tf)
-    url_2t = f"https://www.boatrace.jp/owpc/pc/race/odds2tf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    soup_2t = get_soup(session, url_2t)
-    nirentan_text = "取得失敗"
-
-    if soup_2t:
-        try:
-            # 1号艇頭の人気どころだけ抜粋する (1-2, 1-3, 1-4あたり)
-            # ※テーブル構造が複雑なため、テキストから正規表現で拾う等の工夫も有効だが
-            # ここでは1号艇の行(最初の行)を狙う
-            target_odds = []
-            # 2連単テーブルを探す
-            tables = soup_2t.select("table")
-            for tbl in tables:
-                if "2連単" in str(soup_2t) and "小山" in str(soup_2t): # 簡易チェック
-                    pass
+    # 1. 単勝オッズ取得
+    if target_boat:
+        url_tan = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
+        soup_tan = get_soup(session, url_tan)
+        if soup_tan:
+            try:
+                # 艇番を探して、その行のオッズを取得
+                # <td class="is-boatColor1">1</td> ... <td class="oddsPoint">1.3</td>
+                # クラス名で艇番を特定するのが確実
+                boat_class = f"is-boatColor{target_boat}"
+                td_boat = soup_tan.find("td", class_=boat_class)
                 
-                # 行単位で解析（1号艇の行）
-                rows = tbl.select("tr")
-                for r in rows:
-                    if "1" in r.select_one("th, td").text: # 1号艇の行っぽい
-                        tds = r.select("td.oddsPoint")
-                        # データがあれば上から順に 1-2, 1-3... の可能性が高いが
-                        # 確実性のため、ページ全体のテキストから "1-2" の周辺を探す等のロジック推奨
-                        # 今回は簡易的に「オッズページへのリンク」がある前提で処理せず、
-                        # 存在確認だけしてGroqにURLを渡す運用もアリだが、
-                        # ここでは文字データを整形して返す
-                        pass
+                # 見つかったTDの親行(tr)からオッズを探す
+                if td_boat:
+                    row = td_boat.find_parent("tr")
+                    odds_td = row.select_one("td.oddsPoint")
+                    if odds_td:
+                        result["tansho"] = clean_text(odds_td.text)
+            except: pass
+
+    # 2. 2連単オッズ取得
+    if target_combo:
+        try:
+            head, heel = target_combo.split('-') # 1-2 なら head=1, heel=2
+            url_2t = f"https://www.boatrace.jp/owpc/pc/race/odds2tf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
+            soup_2t = get_soup(session, url_2t)
             
-            # 簡易実装: とりあえず単勝が取れていれば判断材料にはなる
-            # 2連単は組み合わせが多いため、「1号艇頭」の信頼度チェック用として
-            # ページのテキスト全体を少し渡す手もあるが、長くなるので割愛し、
-            # 単勝オッズをメインに判断させる
-            nirentan_text = "詳細取得略(URL参照)" 
-            
-            # もし特定できればここで埋める
-            # 例: 1-2: 2.7, 1-3: 4.8 ... 
+            if soup_2t:
+                # 2連単ページは構造が複雑（1号艇頭の表、2号艇頭の表...と並んでいる）
+                # head号艇がヘッダーになっているテーブルを探す戦略
+                tables = soup_2t.select("div.table1") # 各艇頭のテーブル群
+                
+                for tbl_div in tables:
+                    # そのテーブルが「head号艇」のものか確認
+                    # ヘッダーのクラスで判定 (is-boatColor1 など)
+                    header_th = tbl_div.select_one(f"th.is-boatColor{head}")
+                    if header_th:
+                        # このテーブルの中に target_combo があるはず
+                        # ヒモ(heel)の番号を持つ td を探す
+                        # <td class="is-boatColor2">2</td> ... <td class="oddsPoint">2.7</td>
+                        heel_tds = tbl_div.select(f"td.is-boatColor{heel}")
+                        for td in heel_tds:
+                            # 2連単のヒモ艇番セルか確認（テキストが一致するか）
+                            if clean_text(td.text) == str(heel):
+                                # その隣(直後)のtdがオッズ
+                                next_td = td.find_next_sibling("td")
+                                if next_td and "oddsPoint" in next_td.get("class", []):
+                                    result["nirentan"] = clean_text(next_td.text)
+                                    break
         except: pass
 
-    return {"tansho": tansho_text, "nirentan": nirentan_text}
+    return result
 
 def scrape_race_data(session, jcd, rno, date_str):
     base_url = "https://www.boatrace.jp/owpc/pc/race"
