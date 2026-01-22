@@ -164,8 +164,8 @@ def is_target_race(deadline_str, now_dt):
         
         if now_dt > d_dt: return False
         
-        # 40分以内なら対象
-        return (d_dt - now_dt) <= datetime.timedelta(minutes=40)
+        # ★修正: 40分 → 60分に変更（より早く検知）
+        return (d_dt - now_dt) <= datetime.timedelta(minutes=60)
         
     except:
         return True
@@ -195,7 +195,6 @@ def process_venue(jcd, today, notified, bst):
             raw = scrape_race_data(sess, jcd, rno, today)
             if not raw: continue 
             
-            # ★ここで40分以内判定
             if not is_target_race(raw.get('deadline_time'), now):
                 continue
             
@@ -230,7 +229,7 @@ def main():
     start_time = time.time()
     MAX_RUNTIME = 6 * 3600
     
-    print("🚀 Bot起動")
+    print("🚀 Bot起動 (高速スキャンモード)")
     init_db()
     
     # モデル解凍
@@ -256,7 +255,6 @@ def main():
         now = datetime.datetime.now(JST)
         today = now.strftime('%Y%m%d')
         
-        # ★修正済み: 23時報告を確実にするため23:10まで稼働
         if now.hour >= 23 and now.minute >= 10:
             print("🌙 業務終了")
             break
@@ -320,7 +318,8 @@ def main():
             push_data()
 
         elapsed = time.time() - cycle_start
-        sleep_time = max(0, 600 - elapsed) # 10分おき
+        # ★修正: 10分(600) → 3分(180)に変更し、頻繁にチェック
+        sleep_time = max(0, 180 - elapsed) 
         print(f"⏳ 待機: {int(sleep_time)}秒")
         time.sleep(sleep_time)
 
