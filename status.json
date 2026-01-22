@@ -998,6 +998,14 @@
             "date": "20260122",
             "combo": "1-3",
             "checked": false
+        },
+        {
+            "id": "20260122_08_4",
+            "jcd": 8,
+            "rno": 4,
+            "date": "20260122",
+            "combo": "1-3",
+            "checked": false
         }
     ],
     "results": [],
