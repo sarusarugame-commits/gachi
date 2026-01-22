@@ -40,12 +40,19 @@ t_delta = datetime.timedelta(hours=9)
 JST = datetime.timezone(t_delta, 'JST')
 
 # ==========================================
-# 🤖 Groq API & Discord
+# 🤖 Groq API & Discord (デバッグ強化版)
 # ==========================================
 def call_groq_api(prompt):
     api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key: return "APIキー未設定"
     
+    # APIキーの状態確認ログ
+    if not api_key:
+        print("❌ [Groq] APIキーが設定されていません (GROQ_API_KEY is missing)")
+        return "APIキー未設定"
+    else:
+        # セキュリティのため先頭4文字だけ表示
+        print(f"🔑 [Groq] APIキー確認: {api_key[:4]}****")
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -56,22 +63,44 @@ def call_groq_api(prompt):
         "temperature": 0.7
     }
     
+    print(f"📤 [Groq] リクエスト送信中... (Model: {GROQ_MODEL_NAME})")
+    start_time = time.time()
+    
     try:
-        res = requests.post(GROQ_API_URL, headers=headers, json=data, timeout=10)
+        # タイムアウトを30秒に延長
+        res = requests.post(GROQ_API_URL, headers=headers, json=data, timeout=30)
+        elapsed = time.time() - start_time
+        
+        print(f"⏱️ [Groq] 応答時間: {elapsed:.2f}秒, Status: {res.status_code}")
+
         if res.status_code == 200:
-            return res.json()['choices'][0]['message']['content']
+            content = res.json()['choices'][0]['message']['content']
+            print("✅ [Groq] 応答受信成功")
+            return content
         else:
-            print(f"⚠️ Groq Error: {res.status_code} {res.text}")
+            print(f"⚠️ [Groq] Error Status: {res.status_code}")
+            print(f"⚠️ [Groq] Error Body: {res.text}") # エラーの詳細を表示
             return f"エラー({res.status_code})"
+            
+    except requests.exceptions.Timeout:
+        print("⏰ [Groq] タイムアウト (30秒経過)")
+        return "タイムアウト"
     except Exception as e:
-        print(f"⚠️ Groq通信エラー: {e}")
+        print(f"🔥 [Groq] 例外発生: {e}")
+        traceback.print_exc() # 詳細なエラースタックトレースを表示
         return "応答なし"
 
 def send_discord(content):
     url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not url: return
-    try: requests.post(url, json={"content": content}, timeout=10)
-    except: pass
+    if not url:
+        print("⚠️ Discord Webhook URL未設定")
+        return
+    try: 
+        res = requests.post(url, json={"content": content}, timeout=10)
+        if res.status_code not in [200, 204]:
+            print(f"❌ Discord送信失敗: {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"❌ Discord送信エラー: {e}")
 
 # ==========================================
 # 🗄️ DB & Logic
@@ -144,7 +173,11 @@ def process_prediction(jcd, today, notified_ids, bst):
 
             if prob >= THRESHOLD_NIRENTAN or win_p[best_b] >= THRESHOLD_TANSHO:
                 place = PLACE_NAMES.get(jcd, "会場")
+                print(f"🎯 候補発見: {place}{rno}R (Prob: {prob:.2f}) -> Groqへ問い合わせ中...")
+                
                 prompt = f"{place}{rno}R。単勝{best_b}({win_p[best_b]:.0%})、二連単{combo}({prob:.0%})。推奨理由を一言。"
+                
+                # 詳細ログ付きGroq呼び出し
                 comment = call_groq_api(prompt)
                 
                 pred_list.append({
@@ -153,32 +186,28 @@ def process_prediction(jcd, today, notified_ids, bst):
                     'win_prob': win_p[best_b], 'comment': comment, 
                     'deadline': raw.get('deadline_time')
                 })
-        except: continue
+        except Exception as e:
+            # print(f"Skip {jcd}-{rno}: {e}")
+            continue
     return pred_list
 
 def main():
     print(f"🚀 [Main] 高速予想Bot起動 (Model: {GROQ_MODEL_NAME})")
     init_db()
     
-    # ★修正箇所：分割ファイルの結合ロジックを復活
+    # モデルファイルの準備
     if not os.path.exists(MODEL_FILE):
-        # model.zip が無い場合、model_part_* を探して結合する
         if not os.path.exists(ZIP_MODEL):
             if os.path.exists('model_part_1') or os.path.exists('model_part_01'):
                 print("📦 分割モデルを結合中...")
                 with open(ZIP_MODEL, 'wb') as f_out:
-                    for i in range(1, 20): # 最大20分割まで想定
-                        # model_part_1 と model_part_01 の両パターンに対応
+                    for i in range(1, 20):
                         part_name = f'model_part_{i}'
-                        if not os.path.exists(part_name):
-                             part_name = f'model_part_{i:02d}'
-                        
+                        if not os.path.exists(part_name): part_name = f'model_part_{i:02d}'
                         if os.path.exists(part_name):
                             with open(part_name, 'rb') as f_in: f_out.write(f_in.read())
-                        else:
-                            break # ファイルが途切れたら終了
+                        else: break
 
-        # model.zip があれば解凍
         if os.path.exists(ZIP_MODEL):
             print("📦 モデルを解凍中...")
             with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
@@ -189,9 +218,6 @@ def main():
         print("✅ モデル読み込み成功")
     except Exception as e:
         print(f"🔥 モデル読み込み失敗: {e}")
-        # GitHub Actionsでのデバッグ用にファイル一覧を表示
-        print("📂 現在のフォルダ構成:")
-        print(os.listdir('.'))
         return
 
     while True:
@@ -199,7 +225,6 @@ def main():
         now = datetime.datetime.now(JST)
         today = now.strftime('%Y%m%d')
         
-        # 23:10 終了
         if now.hour >= 23 and now.minute >= 10:
             print("🌙 業務終了")
             break
@@ -235,7 +260,7 @@ def main():
                        f"🤖 {pred['comment']}\n"
                        f"[出走表](https://www.boatrace.jp/owpc/pc/race/racelist?rno={pred['rno']}&jcd={pred['jcd']:02d}&hd={pred['date']})")
                 send_discord(msg)
-                print(f"✅ 通知: {place}{pred['rno']}R")
+                print(f"✅ 通知送信: {place}{pred['rno']}R")
             conn.commit()
             conn.close()
 
