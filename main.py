@@ -90,6 +90,7 @@ def report_worker():
     
     while True:
         try:
+            # 1. 結果チェック
             conn = sqlite3.connect(DB_FILE, timeout=30)
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
@@ -99,9 +100,8 @@ def report_worker():
 
             if len(pending_races) > 0:
                 print(f"🔎 [Report] 結果待ち確認中... ({len(pending_races)}件)")
-                
-            sess = requests.Session()
             
+            sess = requests.Session()
             for race in pending_races:
                 try:
                     parts = race['race_id'].split('_')
@@ -133,14 +133,19 @@ def report_worker():
                     print(f"⚠️ [Report] Check Error: {e}")
                     continue
 
+            # 2. 定期報告チェック
             now = datetime.datetime.now(JST)
             today = now.strftime('%Y%m%d')
             current_key = f"{today}_{now.hour}"
             
+            print(f"🕒 [Report] 現在:{now.hour}時 (報告済:{last_report_key})") # デバッグログ
+
             if now.hour in REPORT_HOURS and last_report_key != current_key:
+                # 23時の場合、レース終了を考慮して少し待つ
                 if now.hour == 23 and now.minute < 10:
-                    pass
+                    print("⏳ [Report] 23時待機中...")
                 else:
+                    # DBから集計
                     conn = sqlite3.connect(DB_FILE, timeout=30)
                     c = conn.cursor()
                     c.execute("SELECT count(*), sum(is_win), sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
@@ -149,6 +154,8 @@ def report_worker():
                     pending_cnt = c.fetchone()[0]
                     conn.close()
                     
+                    print(f"📈 [Report] データ確認: 完了{cnt}件, 待機{pending_cnt}件") # デバッグログ
+
                     if (cnt or 0) > 0 or (pending_cnt or 0) > 0:
                         msg = (f"**📊 {now.hour}時の収支報告**\n"
                                f"✅ 完了: {cnt or 0}R (的中: {wins or 0})\n"
@@ -157,6 +164,8 @@ def report_worker():
                         send_discord(msg)
                         print(f"📢 [Report] 定期報告送信: {now.hour}時")
                         last_report_key = current_key
+                    else:
+                        print("ℹ️ [Report] 対象データなしのためスキップ")
 
         except Exception as e:
             print(f"🔥 [Report] Thread Error: {e}")
@@ -313,7 +322,6 @@ def main():
                 odds_t = pred['odds'].get('tansho', '-')
                 odds_n = pred['odds'].get('nirentan', '-')
 
-                # ★修正: 自信度(%)を追加したフォーマット
                 msg = (f"🔥 **{place}{pred['rno']}R** {t_disp}\n"
                        f"🛶 本命: {pred['best_boat']}号艇 (勝率:{pred['win_prob']:.0%})\n"
                        f"🎯 推奨: {pred['combo']} (的中率:{pred['prob']:.0%})\n"
