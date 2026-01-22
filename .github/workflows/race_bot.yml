@@ -33,20 +33,28 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          # メインスクリプト実行 (統合版なのでこれ1つでOK)
           python main.py
 
-      - name: Save Database
-        # タイムアウトや終了時に必ず実行
+      - name: Force Save Database
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "bot@noreply.github.com"
+          
+          # 最新のリモート情報を取得
+          git fetch origin main
+          
+          # ローカルの変更（新しいDB）を維持したまま、履歴をリモートに合わせる
+          # これにより「競合」判定を回避して、強制的にコミットできるようにする
+          git reset origin/main
+          
+          # データベースを追加
           git add race_data.db
+          
+          # コミット＆プッシュ
           if git diff --staged --quiet; then
-            echo "No changes"
+            echo "No changes to commit."
           else
             git commit -m "Update race data [skip ci]"
-            git pull origin main --rebase
             git push origin main
           fi
