@@ -2,7 +2,13 @@ name: Boat Race Bot
 
 on:
   schedule:
+    # ⏰ UTC時間で記述 (JST = UTC+9)
+    # JST 08:30 (UTC 23:30) - 朝〜昼
     - cron: '30 23 * * *'
+    # JST 14:30 (UTC 05:30) - 昼〜夕
+    - cron: '30 5 * * *'
+    # JST 20:30 (UTC 11:30) - 夕〜ナイター終了
+    - cron: '30 11 * * *'
   workflow_dispatch:
 
 permissions:
@@ -36,22 +42,17 @@ jobs:
           python main.py
 
       - name: Force Save Database
+        # 正常終了時も、エラー時も必ず実行してデータを残す
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "bot@noreply.github.com"
           
-          # 最新のリモート情報を取得
+          # コンフリクトを無視して、今回の実行結果を正とする
           git fetch origin main
-          
-          # ローカルの変更（新しいDB）を維持したまま、履歴をリモートに合わせる
-          # これにより「競合」判定を回避して、強制的にコミットできるようにする
           git reset origin/main
-          
-          # データベースを追加
           git add race_data.db
           
-          # コミット＆プッシュ
           if git diff --staged --quiet; then
             echo "No changes to commit."
           else
