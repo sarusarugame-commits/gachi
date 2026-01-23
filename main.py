@@ -10,6 +10,7 @@ import concurrent.futures
 import zipfile
 import traceback
 import threading
+import re # 正規表現用
 
 # scraper.py から必要な機能をすべてインポート
 from scraper import scrape_race_data, scrape_odds, scrape_result
@@ -21,7 +22,9 @@ DB_FILE = "race_data.db"
 BET_AMOUNT = 1000
 THRESHOLD_NIRENTAN = 0.50
 THRESHOLD_TANSHO   = 0.75
-REPORT_HOURS = [13, 18, 23]
+
+# ★修正: デバッグのため 8時〜23時まで 毎時報告 する
+REPORT_HOURS = list(range(8, 24)) 
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -38,6 +41,31 @@ PLACE_NAMES = {
 
 t_delta = datetime.timedelta(hours=9)
 JST = datetime.timezone(t_delta, 'JST')
+
+# ==========================================
+# 🛠️ ユーティリティ
+# ==========================================
+def extract_odds_value(odds_text, target_boat=None):
+    """
+    オッズのテキスト（例: '1号艇:1.5' や '1-2:2.7'）から数値だけを抜き出す
+    """
+    try:
+        # 単勝の場合のターゲット指定 ("1" など) があればそこを探す
+        if target_boat:
+            # "1号艇:1.5" のような文字列からターゲットを探す
+            pattern = re.compile(rf"{target_boat}号艇:(\d+\.\d+)")
+            match = pattern.search(odds_text)
+            if match:
+                return float(match.group(1))
+        
+        # 2連単や、ターゲット指定なしで最初の数値を拾う場合
+        # 文字列の中から最初の浮動小数点数を探す
+        match = re.search(r"(\d+\.\d+)", odds_text)
+        if match:
+            return float(match.group(1))
+    except:
+        pass
+    return 0.0
 
 # ==========================================
 # 🤖 API & Discord
@@ -82,10 +110,10 @@ def init_db():
     conn.close()
 
 # ==========================================
-# 📊 報告・結果確認ロジック (別スレッド用)
+# 📊 報告・結果確認ロジック (別スレッド)
 # ==========================================
 def report_worker():
-    print("📋 [Report] 報告スレッド起動 (バックグラウンド)")
+    print("📋 [Report] 報告スレッド起動")
     last_report_key = ""
     
     while True:
@@ -98,9 +126,6 @@ def report_worker():
             pending_races = c.fetchall()
             conn.close()
 
-            if len(pending_races) > 0:
-                print(f"🔎 [Report] 結果待ち確認中... ({len(pending_races)}件)")
-            
             sess = requests.Session()
             for race in pending_races:
                 try:
@@ -129,52 +154,43 @@ def report_worker():
                         send_discord(msg)
                         print(f"📊 [Report] 結果判明: {place}{rno}R")
                         time.sleep(1)
-                except Exception as e:
-                    print(f"⚠️ [Report] Check Error: {e}")
-                    continue
+                except: continue
 
-            # 2. 定期報告チェック
+            # 2. 定期報告（毎時実行）
             now = datetime.datetime.now(JST)
             today = now.strftime('%Y%m%d')
             current_key = f"{today}_{now.hour}"
             
-            print(f"🕒 [Report] 現在:{now.hour}時 (報告済:{last_report_key})") # デバッグログ
-
             if now.hour in REPORT_HOURS and last_report_key != current_key:
-                # 23時の場合、レース終了を考慮して少し待つ
-                if now.hour == 23 and now.minute < 10:
-                    print("⏳ [Report] 23時待機中...")
-                else:
-                    # DBから集計
-                    conn = sqlite3.connect(DB_FILE, timeout=30)
-                    c = conn.cursor()
-                    c.execute("SELECT count(*), sum(is_win), sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
-                    cnt, wins, profit = c.fetchone()
-                    c.execute("SELECT count(*) FROM history WHERE date=? AND status='PENDING'", (today,))
-                    pending_cnt = c.fetchone()[0]
-                    conn.close()
-                    
-                    print(f"📈 [Report] データ確認: 完了{cnt}件, 待機{pending_cnt}件") # デバッグログ
-
-                    if (cnt or 0) > 0 or (pending_cnt or 0) > 0:
-                        msg = (f"**📊 {now.hour}時の収支報告**\n"
-                               f"✅ 完了: {cnt or 0}R (的中: {wins or 0})\n"
-                               f"⏳ 待機: {pending_cnt or 0}R\n"
-                               f"💵 収支: {'+' if (profit or 0)>0 else ''}{profit or 0}円")
-                        send_discord(msg)
-                        print(f"📢 [Report] 定期報告送信: {now.hour}時")
-                        last_report_key = current_key
-                    else:
-                        print("ℹ️ [Report] 対象データなしのためスキップ")
+                conn = sqlite3.connect(DB_FILE, timeout=30)
+                c = conn.cursor()
+                c.execute("SELECT count(*), sum(is_win), sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
+                cnt, wins, profit = c.fetchone()
+                c.execute("SELECT count(*) FROM history WHERE date=? AND status='PENDING'", (today,))
+                pending_cnt = c.fetchone()[0]
+                conn.close()
+                
+                # ★修正: データがなくても生存報告として送る（デバッグ用）
+                status_emoji = "🟢" if (pending_cnt > 0) else "💤"
+                msg = (f"**🛠️ {now.hour}時の定期報告**\n"
+                       f"状態: {status_emoji} 稼働中\n"
+                       f"✅ 完了: {cnt or 0}R (的中: {wins or 0})\n"
+                       f"⏳ 待機: {pending_cnt or 0}R\n"
+                       f"💵 収支: {'+' if (profit or 0)>0 else ''}{profit or 0}円")
+                
+                send_discord(msg)
+                print(f"📢 [Report] 定期報告送信: {now.hour}時")
+                last_report_key = current_key
 
         except Exception as e:
-            print(f"🔥 [Report] Thread Error: {e}")
+            print(f"🔥 [Report] Error: {e}")
             traceback.print_exc()
         
-        time.sleep(600)
+        # 5分待機
+        time.sleep(300)
 
 # ==========================================
-# 🚤 予想ロジック (メインスレッド用)
+# 🚤 予想ロジック (メインスレッド)
 # ==========================================
 def engineer_features(df):
     for i in range(1, 7): df[f'power_idx_{i}'] = df[f'wr{i}'] * (1.0 / (df[f'st{i}'] + 0.01))
@@ -213,7 +229,6 @@ def process_prediction(jcd, today, notified_ids, bst):
         try:
             raw = scrape_race_data(sess, jcd, rno, today)
             if not raw: continue 
-            
             if not is_target_race(raw.get('deadline_time'), now): continue
             
             df = engineer_features(pd.DataFrame([raw]))
@@ -231,18 +246,30 @@ def process_prediction(jcd, today, notified_ids, bst):
                 place = PLACE_NAMES.get(jcd, "会場")
                 print(f"🎯 [Main] 候補発見: {place}{rno}R (信頼度:{win_p[best_b]:.0%}) -> オッズ確認")
                 
+                # オッズ取得
                 odds_data = scrape_odds(sess, jcd, rno, today, target_boat=str(best_b), target_combo=combo)
                 
+                # ★追加機能: 逆ザヤ(期待値)計算
+                # 単勝オッズ数値化
+                real_odds = extract_odds_value(odds_data['tansho'], target_boat=str(best_b))
+                # 期待値 = オッズ × 勝率
+                expected_value = real_odds * win_p[best_b]
+                
+                print(f"💰 [Main] 期待値計算: オッズ{real_odds} x 勝率{win_p[best_b]:.2f} = {expected_value:.2f}")
+
                 prompt = f"""
                 ボートレース投資判断。
+                
                 【対象】{place}{rno}R (締切:{raw.get('deadline_time')})
-                【予測】本命:{best_b}号艇 / 2連単:{combo} (信頼度:{prob:.0%})
-                【オッズ】単勝:{odds_data['tansho']} / 2連単:{odds_data['nirentan']}
+                【AI予測】本命:{best_b}号艇 (勝率:{win_p[best_b]:.0%}) / 2連単:{combo} (的中率:{prob:.0%})
+                【現在オッズ】単勝:{odds_data['tansho']} / 2連単:{odds_data['nirentan']}
+                
+                【期待値チェック】
+                AI算出の単勝期待値: {expected_value:.2f} (1.0以上でプラス収支見込み)
                 
                 【指示】
-                オッズ妙味を考慮し「買い」か「見」か判断せよ。
-                結論と理由を【40文字以内】で簡潔に書け。
-                挨拶不要。体言止め推奨。
+                このオッズは「逆ザヤ（勝率の割にオッズが高い）」でお買い得か、それとも「過剰人気」か判定してください。
+                結論(買い/見)と、40文字以内の解説をお願いします。
                 """
                 
                 comment = call_groq_api(prompt)
@@ -252,7 +279,8 @@ def process_prediction(jcd, today, notified_ids, bst):
                     'combo': combo, 'prob': prob, 'best_boat': best_b, 
                     'win_prob': win_p[best_b], 'comment': comment, 
                     'deadline': raw.get('deadline_time'),
-                    'odds': odds_data
+                    'odds': odds_data,
+                    'ev': expected_value
                 })
         except: continue
     return pred_list
@@ -284,13 +312,18 @@ def main():
     t = threading.Thread(target=report_worker, daemon=True)
     t.start()
 
+    start_ts = time.time()
+
     while True:
-        start_ts = time.time()
         now = datetime.datetime.now(JST)
         today = now.strftime('%Y%m%d')
         
         if now.hour >= 23 and now.minute >= 10:
-            print("🌙 業務終了")
+            print("🌙 業務終了 (23:10)")
+            break
+
+        if time.time() - start_ts > 21000:
+            print("🛑 タイムリミット (再起動待機)")
             break
 
         conn = sqlite3.connect(DB_FILE, timeout=30)
@@ -321,22 +354,25 @@ def main():
                 odds_url = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={pred['rno']}&jcd={pred['jcd']:02d}&hd={pred['date']}"
                 odds_t = pred['odds'].get('tansho', '-')
                 odds_n = pred['odds'].get('nirentan', '-')
+                ev_val = pred.get('ev', 0.0)
 
+                # 通知メッセージの調整
                 msg = (f"🔥 **{place}{pred['rno']}R** {t_disp}\n"
                        f"🛶 本命: {pred['best_boat']}号艇 (勝率:{pred['win_prob']:.0%})\n"
-                       f"🎯 推奨: {pred['combo']} (的中率:{pred['prob']:.0%})\n"
-                       f"💰 オッズ: 単勝【{odds_t}】 / 2単【{odds_n}】\n"
+                       f"🎯 推奨: {pred['combo']} (的中:{pred['prob']:.0%})\n"
+                       f"💰 オッズ: 単{odds_t} / 2単{odds_n}\n"
+                       f"📈 期待値: {ev_val:.2f} (1.0超で狙い目)\n"
                        f"━━━━━━━━━━━━━━\n"
                        f"🤖 **{pred['comment']}**\n"
                        f"━━━━━━━━━━━━━━\n"
-                       f"📊 [オッズ]({odds_url})")
+                       f"📊 [オッズ確認]({odds_url})")
                 send_discord(msg)
                 print(f"✅ [Main] 通知: {place}{pred['rno']}R")
             conn.commit()
             conn.close()
 
         elapsed = time.time() - start_ts
-        sleep_time = max(0, 180 - elapsed)
+        sleep_time = max(0, 180 - elapsed % 180)
         print(f"⏳ [Main] 待機: {int(sleep_time)}秒")
         time.sleep(sleep_time)
 
