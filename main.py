@@ -73,6 +73,7 @@ def send_discord(content):
     except: pass
 
 def get_db_connection():
+    # オートコミットモード (即時保存)
     conn = sqlite3.connect(DB_FILE, timeout=60, isolation_level=None)
     conn.row_factory = sqlite3.Row
     return conn
@@ -102,12 +103,12 @@ def report_worker():
             conn = get_db_connection()
             c = conn.cursor()
             
-            # DBの未確定レースをチェック
+            # PENDINGデータをチェック
             c.execute("SELECT * FROM history WHERE status='PENDING'")
             pending_races = c.fetchall()
             
             if len(pending_races) > 0:
-                print(f"🔎 [Report] 結果確認中: {len(pending_races)}件")
+                print(f"🔎 [Report] 確認中: {len(pending_races)}件")
 
             sess = requests.Session()
             updates = 0
@@ -117,6 +118,7 @@ def report_worker():
                     parts = race['race_id'].split('_')
                     date_str, jcd, rno = parts[0], int(parts[1]), int(parts[2])
                     
+                    # 結果取得
                     res = scrape_result(sess, jcd, rno, date_str)
                     
                     if res:
@@ -125,15 +127,20 @@ def report_worker():
                         profit = -BET_AMOUNT
                         actual_result = ""
                         payout = 0
-
-                        # 単勝・2連単の分岐
+                        
+                        # 判定ロジック
+                        type_lbl = ""
                         if "-" in str(pred_combo):
+                            # 2連単予想
+                            type_lbl = "2単"
                             actual_result = res['nirentan_combo']
                             payout = res['nirentan_payout']
                             if str(pred_combo) == str(actual_result):
                                 is_win = 1
                                 profit = payout - BET_AMOUNT
                         else:
+                            # 単勝予想
+                            type_lbl = "単勝"
                             actual_result = res['tansho_boat']
                             payout = res['tansho_payout']
                             if str(pred_combo) == str(actual_result):
@@ -148,15 +155,16 @@ def report_worker():
                                   (actual_result, is_win, payout, profit, race['race_id']))
                         updates += 1
                         
-                        # ★追加: 当日の累計収支を計算
+                        # ★追加: 本日の累計収支を計算
                         c.execute("SELECT sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
                         daily_profit = c.fetchone()[0] or 0
                         
                         place = PLACE_NAMES.get(jcd, "会場")
-                        type_lbl = "2単" if "-" in str(pred_combo) else "単勝"
+                        tansho_res = res['tansho_boat'] if res['tansho_boat'] else "?"
                         
+                        # 結果メッセージ (単勝結果も併記)
                         msg = (f"{'🎊 的中' if is_win else '💀 外れ'} {place}{rno}R ({type_lbl})\n"
-                               f"予測:{pred_combo} → 結果:{actual_result}\n"
+                               f"予測:{pred_combo} → 結果:{actual_result} (単:{tansho_res})\n"
                                f"収支:{'+' if profit>0 else ''}{profit}円\n"
                                f"📉 本日累計: {'+' if daily_profit>0 else ''}{daily_profit}円")
                         send_discord(msg)
@@ -364,6 +372,7 @@ def main():
                     
                     t_disp = f"(締切 {pred['deadline']})" if pred['deadline'] else ""
                     odds_url = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={pred['rno']}&jcd={pred['jcd']:02d}&hd={pred['date']}"
+                    
                     odds_t = pred['odds'].get('tansho', '-')
                     odds_n = pred['odds'].get('nirentan', '-')
                     ev_val = pred.get('ev', 0.0)
