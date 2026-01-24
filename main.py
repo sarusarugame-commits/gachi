@@ -21,14 +21,15 @@ from scraper import scrape_race_data, scrape_odds, scrape_result
 DB_FILE = "race_data.db"
 BET_AMOUNT = 1000
 
-# 閾値を元に戻しました。
-# これにより「通知対象となる自信のあるレース」のみが購入対象として記録されます。
+# 自信のあるレースのみ通知（しきい値設定）
 THRESHOLD_NIRENTAN = 0.15
 THRESHOLD_TANSHO   = 0.40
 
 REPORT_HOURS = list(range(8, 24))
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# ⚠️ モデル名は変更しません
 GROQ_MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 MODEL_FILE = 'boat_model_nirentan.txt'
@@ -60,11 +61,44 @@ def extract_odds_value(odds_text, target_boat=None):
 def call_groq_api(prompt):
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key: return "APIキー未設定"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    data = {"model": GROQ_MODEL_NAME, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3}
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # 【変更箇所】システムプロンプトを追加し、日本語出力・解説禁止を強制
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "あなたは日本のボートレース予想記者です。"
+                "提供されたデータを元に、推奨理由を一言（日本語40文字以内）で述べてください。"
+                "英語の解説、挨拶、分析の過程は一切出力しないでください。"
+                "出力は推奨コメントのみにしてください。"
+            )
+        },
+        {
+            "role": "user",
+            "content": f"データ: {prompt}\nこのデータの推奨理由を日本語40文字以内で書いて。"
+        }
+    ]
+    
+    data = {
+        "model": GROQ_MODEL_NAME,
+        "messages": messages,
+        "temperature": 0.3, 
+        "max_tokens": 60
+    }
+    
     try:
         res = requests.post(GROQ_API_URL, headers=headers, json=data, timeout=30)
-        if res.status_code == 200: return res.json()['choices'][0]['message']['content']
+        if res.status_code == 200:
+            content = res.json()['choices'][0]['message']['content']
+            # 余計な空白や改行、引用符を削除
+            return content.replace("\n", "").replace('"', '').replace("`", "").strip()
+        else:
+            return "応答エラー"
     except: return "応答なし"
 
 def send_discord(content):
@@ -286,7 +320,7 @@ def process_prediction(jcd, today, notified_ids, bst):
             # ここで判定し、条件を満たせば「購入（PENDING）」としてDBに入れる
             if rid_tansho not in notified_ids and win_p[best_b] >= THRESHOLD_TANSHO:
                 ev_t = real_odds_t * win_p[best_b]
-                prompt = f"単勝{best_b}。EV:{ev_t:.2f}。買い判定。40文字以内。"
+                prompt = f"単勝{best_b}番。期待値{ev_t:.2f}。購入推奨。"
                 comment = call_groq_api(prompt)
                 
                 pred_list.append({
@@ -300,7 +334,7 @@ def process_prediction(jcd, today, notified_ids, bst):
             # --- 2連単の登録（閾値チェックあり）---
             if rid_nirentan not in notified_ids and prob >= THRESHOLD_NIRENTAN:
                 ev_n = real_odds_n * prob
-                prompt = f"2単{combo}。EV:{ev_n:.2f}。買い判定。40文字以内。"
+                prompt = f"2連単{combo}。期待値{ev_n:.2f}。購入推奨。"
                 comment = call_groq_api(prompt)
 
                 pred_list.append({
