@@ -21,7 +21,8 @@ from scraper import scrape_race_data, scrape_odds, scrape_result
 DB_FILE = "race_data.db"
 BET_AMOUNT = 1000
 
-# 閾値
+# 閾値を元に戻しました。
+# これにより「通知対象となる自信のあるレース」のみが購入対象として記録されます。
 THRESHOLD_NIRENTAN = 0.15
 THRESHOLD_TANSHO   = 0.40
 
@@ -112,6 +113,7 @@ def report_worker():
             conn = get_db_connection()
             c = conn.cursor()
             
+            # PENDING（購入済み・未確定）のレースを確認
             c.execute("SELECT * FROM history WHERE status='PENDING'")
             pending_races = c.fetchall()
             
@@ -121,7 +123,7 @@ def report_worker():
             for race in pending_races:
                 try:
                     parts = race['race_id'].split('_')
-                    # ID形式: YYYYMMDD_JJ_RR_TYPE or YYYYMMDD_JJ_RR
+                    # ID形式: YYYYMMDD_JJ_RR_TYPE
                     date_str = parts[0]
                     jcd = int(parts[1])
                     rno = int(parts[2])
@@ -133,7 +135,7 @@ def report_worker():
                     if res:
                         pred_combo = race['predict_combo'] 
                         is_win = 0
-                        profit = -BET_AMOUNT
+                        profit = -BET_AMOUNT # デフォルトで負け（投資分マイナス）
                         actual_result = ""
                         payout = 0
                         
@@ -142,7 +144,7 @@ def report_worker():
                         tansho_res = res['tansho_boat']
                         tansho_pay = res['tansho_payout']
                         
-                        # 判定
+                        # 単勝か2連単か判定
                         if "-" in str(pred_combo): # 2連単
                             actual_result = nirentan_res
                             payout = nirentan_pay
@@ -158,6 +160,7 @@ def report_worker():
 
                         if not actual_result: continue
 
+                        # 結果を更新
                         c.execute("""
                             UPDATE history 
                             SET result_combo=?, is_win=?, payout=?, profit=?, status='FINISHED', result_tansho=?
@@ -177,29 +180,13 @@ def report_worker():
                                f"収支:{'+' if profit>0 else ''}{profit}円\n"
                                f"📉 本日累計: {'+' if daily_profit>0 else ''}{daily_profit}円")
                         send_discord(msg)
-                        print(f"📊 [Report] 判明: {place}{rno}R")
+                        print(f"📊 [Report] 判明: {place}{rno}R ({type_lbl})")
                     
                     time.sleep(1)
                 except: continue
             
             if updates > 0: print(f"✅ [Report] {updates}件更新")
-
-            # 定期報告
-            current_key = f"{today}_{now.hour}"
-            if now.hour in REPORT_HOURS and last_report_key != current_key:
-                # 報告処理... (省略せず実装)
-                c.execute("SELECT count(*), sum(is_win), sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
-                cnt, wins, profit = c.fetchone()
-                c.execute("SELECT count(*) FROM history WHERE status='PENDING'")
-                pending_cnt = c.fetchone()[0]
-                
-                msg = (f"**🛠️ {now.hour}時の定期報告 ({today})**\n"
-                       f"✅ 判明: {cnt or 0}R (的中: {wins or 0})\n"
-                       f"⏳ 待ち: {pending_cnt or 0}R\n"
-                       f"💵 本日収支: {'+' if (profit or 0)>0 else ''}{profit or 0}円")
-                send_discord(msg)
-                last_report_key = current_key
-
+            
             conn.close()
         except Exception as e:
             print(f"🔥 [Report] Error: {e}")
@@ -288,17 +275,18 @@ def process_prediction(jcd, today, notified_ids, bst):
             best_idx = np.argmax(probs)
             combo, prob = COMBOS[best_idx], probs[best_idx]
 
-            # オッズ取得 (1回で済ませる)
+            # オッズ取得
             odds_data = get_odds_with_retry(sess, jcd, rno, today, best_b, combo)
             real_odds_t = extract_odds_value(odds_data['tansho'])
             real_odds_n = extract_odds_value(odds_data['nirentan'])
             if real_odds_t == 0: real_odds_t = 1.0
             if real_odds_n == 0: real_odds_n = 1.0
 
-            # --- 単勝の判定 ---
+            # --- 単勝の登録（閾値チェックあり）---
+            # ここで判定し、条件を満たせば「購入（PENDING）」としてDBに入れる
             if rid_tansho not in notified_ids and win_p[best_b] >= THRESHOLD_TANSHO:
                 ev_t = real_odds_t * win_p[best_b]
-                prompt = f"単勝{best_b}。EV:{ev_t:.2f}。基準1.0以上で買い。40文字以内。"
+                prompt = f"単勝{best_b}。EV:{ev_t:.2f}。買い判定。40文字以内。"
                 comment = call_groq_api(prompt)
                 
                 pred_list.append({
@@ -309,10 +297,10 @@ def process_prediction(jcd, today, notified_ids, bst):
                     'type': '単勝'
                 })
 
-            # --- 2連単の判定 ---
+            # --- 2連単の登録（閾値チェックあり）---
             if rid_nirentan not in notified_ids and prob >= THRESHOLD_NIRENTAN:
                 ev_n = real_odds_n * prob
-                prompt = f"2単{combo}。EV:{ev_n:.2f}。基準1.0以上で買い。40文字以内。"
+                prompt = f"2単{combo}。EV:{ev_n:.2f}。買い判定。40文字以内。"
                 comment = call_groq_api(prompt)
 
                 pred_list.append({
@@ -323,19 +311,12 @@ def process_prediction(jcd, today, notified_ids, bst):
                     'type': '2単'
                 })
             
-            # 条件に合わなければ、次回からスキップするためにリストに入れる
-            if not pred_list:
-                # 今回どちらも引っかからなかった場合のみ（保留）
-                # 実際にはオッズ変動で変わるかもしれないので、本来はスキップしない方がいいが、負荷軽減のため
-                # IGNORE_RACES.add(base_rid) 
-                pass
-
         except: continue
     
     return pred_list, current_daily_profit, formatted_date
 
 def main():
-    print(f"🚀 [Main] 完全統合Bot起動 (Model: {GROQ_MODEL_NAME})")
+    print(f"🚀 [Main] 予測購入モードBot起動 (Model: {GROQ_MODEL_NAME})")
     init_db()
     
     if not os.path.exists(MODEL_FILE):
@@ -393,6 +374,7 @@ def main():
                     now_str = datetime.datetime.now(JST).strftime('%H:%M:%S')
                     place = PLACE_NAMES.get(pred['jcd'], "不明")
                     
+                    # PENDINGステータスで保存（＝購入）
                     c.execute("""
                         INSERT OR IGNORE INTO history 
                         (race_id, date, time, place, race_no, predict_combo, predict_prob, gemini_comment, 
