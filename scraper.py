@@ -42,66 +42,37 @@ def get_deadline_time_accurately(soup, rno):
     except Exception: pass
     return None
 
-# ★修正: ターゲット（予測した買い目）のオッズをピンポイントで取得
 def scrape_odds(session, jcd, rno, date_str, target_boat=None, target_combo=None):
-    """
-    指定された単勝・2連単オッズを取得する
-    target_boat: '1' など
-    target_combo: '1-2' など
-    """
     result = {"tansho": "---", "nirentan": "---"}
-
-    # 1. 単勝オッズ取得
-    if target_boat:
-        url_tan = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-        soup_tan = get_soup(session, url_tan)
-        if soup_tan:
-            try:
-                # 艇番を探して、その行のオッズを取得
-                # <td class="is-boatColor1">1</td> ... <td class="oddsPoint">1.3</td>
-                # クラス名で艇番を特定するのが確実
-                boat_class = f"is-boatColor{target_boat}"
-                td_boat = soup_tan.find("td", class_=boat_class)
-                
-                # 見つかったTDの親行(tr)からオッズを探す
+    try:
+        # 単勝
+        if target_boat:
+            url_tan = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
+            soup_tan = get_soup(session, url_tan)
+            if soup_tan:
+                td_boat = soup_tan.find("td", class_=f"is-boatColor{target_boat}")
                 if td_boat:
                     row = td_boat.find_parent("tr")
                     odds_td = row.select_one("td.oddsPoint")
-                    if odds_td:
-                        result["tansho"] = clean_text(odds_td.text)
-            except: pass
+                    if odds_td: result["tansho"] = clean_text(odds_td.text)
 
-    # 2. 2連単オッズ取得
-    if target_combo:
-        try:
-            head, heel = target_combo.split('-') # 1-2 なら head=1, heel=2
+        # 2連単
+        if target_combo:
+            head, heel = target_combo.split('-')
             url_2t = f"https://www.boatrace.jp/owpc/pc/race/odds2tf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
             soup_2t = get_soup(session, url_2t)
-            
             if soup_2t:
-                # 2連単ページは構造が複雑（1号艇頭の表、2号艇頭の表...と並んでいる）
-                # head号艇がヘッダーになっているテーブルを探す戦略
-                tables = soup_2t.select("div.table1") # 各艇頭のテーブル群
-                
-                for tbl_div in tables:
-                    # そのテーブルが「head号艇」のものか確認
-                    # ヘッダーのクラスで判定 (is-boatColor1 など)
-                    header_th = tbl_div.select_one(f"th.is-boatColor{head}")
-                    if header_th:
-                        # このテーブルの中に target_combo があるはず
-                        # ヒモ(heel)の番号を持つ td を探す
-                        # <td class="is-boatColor2">2</td> ... <td class="oddsPoint">2.7</td>
-                        heel_tds = tbl_div.select(f"td.is-boatColor{heel}")
+                tables = soup_2t.select("div.table1")
+                for tbl in tables:
+                    if tbl.select_one(f"th.is-boatColor{head}"):
+                        heel_tds = tbl.select(f"td.is-boatColor{heel}")
                         for td in heel_tds:
-                            # 2連単のヒモ艇番セルか確認（テキストが一致するか）
                             if clean_text(td.text) == str(heel):
-                                # その隣(直後)のtdがオッズ
                                 next_td = td.find_next_sibling("td")
                                 if next_td and "oddsPoint" in next_td.get("class", []):
                                     result["nirentan"] = clean_text(next_td.text)
                                     break
-        except: pass
-
+    except: pass
     return result
 
 def scrape_race_data(session, jcd, rno, date_str):
@@ -145,20 +116,63 @@ def scrape_race_data(session, jcd, rno, date_str):
     except: return None
     return row
 
+# ★修正: 単勝と2連単の結果を正確に取得する
 def scrape_result(session, jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup = get_soup(session, url)
-    if not soup or "データがありません" in soup.text: return None
+    
+    if not soup: return None
+    if "データがありません" in soup.text: return None
+
+    res = {
+        "tansho_boat": None, "tansho_payout": 0,
+        "nirentan_combo": None, "nirentan_payout": 0
+    }
+
     try:
-        tables = soup.select(".is-w750 table")
-        for table in tables:
-            if "二連単" in table.text:
-                rows = table.select("tr")
-                for r in rows:
-                    if "二連単" in r.text:
-                        tds = r.select("td")
-                        result_combo = clean_text(tds[1].text).replace("-", "-")
-                        payout = int(clean_text(tds[2].text).replace("¥", "").replace(",", ""))
-                        return {"combo": result_combo, "payout": payout}
-    except: pass
+        # 結果テーブルを探す
+        rows = soup.find_all("tr")
+        for row in rows:
+            th_td = row.find(["th", "td"])
+            if not th_td: continue
+            
+            header_text = clean_text(th_td.text)
+            
+            # --- 単勝の取得 ---
+            if "単勝" in header_text:
+                # 艇番: numberSet1_number クラスを持つ span
+                boat_span = row.select_one(".numberSet1_number")
+                if boat_span:
+                    res["tansho_boat"] = clean_text(boat_span.text)
+                
+                # 払戻金: is-payout1 クラスを持つ span
+                payout_span = row.select_one(".is-payout1")
+                if payout_span:
+                    try:
+                        res["tansho_payout"] = int(clean_text(payout_span.text).replace("¥", "").replace(",", ""))
+                    except: pass
+
+            # --- 2連単の取得 ---
+            elif "2連単" in header_text or "二連単" in header_text:
+                # 組番: 複数の numberSet1_number を取得して結合
+                boat_spans = row.select(".numberSet1_number")
+                if len(boat_spans) >= 2:
+                    # [0]が1着, [1]が2着
+                    res["nirentan_combo"] = f"{clean_text(boat_spans[0].text)}-{clean_text(boat_spans[1].text)}"
+                
+                # 払戻金
+                payout_span = row.select_one(".is-payout1")
+                if payout_span:
+                    try:
+                        res["nirentan_payout"] = int(clean_text(payout_span.text).replace("¥", "").replace(",", ""))
+                    except: pass
+
+        # どちらか片方でも取れていれば成功とみなす
+        if res["tansho_boat"] or res["nirentan_combo"]:
+            return res
+
+    except Exception as e:
+        # print(f"Scrape Error: {e}")
+        pass
+        
     return None
