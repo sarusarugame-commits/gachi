@@ -73,6 +73,7 @@ def send_discord(content):
     except: pass
 
 def get_db_connection():
+    # オートコミットモード
     conn = sqlite3.connect(DB_FILE, timeout=60, isolation_level=None)
     conn.row_factory = sqlite3.Row
     return conn
@@ -82,21 +83,33 @@ def init_db():
     c = conn.cursor()
     c.execute("PRAGMA journal_mode=WAL;")
     
-    # ★修正: best_boat (単勝予想) 列を追加
+    # 基本テーブル作成
     c.execute('''CREATE TABLE IF NOT EXISTS history (
         race_id TEXT PRIMARY KEY, date TEXT, time TEXT, place TEXT, race_no INTEGER,
         predict_combo TEXT, predict_prob REAL, gemini_comment TEXT,
-        result_combo TEXT, is_win INTEGER, payout INTEGER, profit INTEGER, status TEXT,
-        best_boat TEXT
+        result_combo TEXT, is_win INTEGER, payout INTEGER, profit INTEGER, status TEXT
     )''')
     
-    # 既存テーブルへの列追加対応 (Migration)
-    try:
-        c.execute("SELECT best_boat FROM history LIMIT 1")
-    except:
-        print("ℹ️ DBアップデート: best_boat列を追加します")
-        c.execute("ALTER TABLE history ADD COLUMN best_boat TEXT")
+    # ★修正: 足りない列があれば追加する（マイグレーション）
+    required_cols = {
+        'best_boat': 'TEXT',
+        'odds_tansho': 'TEXT',
+        'odds_nirentan': 'TEXT',
+        'result_tansho': 'TEXT' # 単勝結果用の列を追加
+    }
     
+    # 現在の列を取得
+    try:
+        c.execute("PRAGMA table_info(history)")
+        existing_cols = {row['name'] for row in c.fetchall()}
+        
+        for col, dtype in required_cols.items():
+            if col not in existing_cols:
+                print(f"ℹ️ DBアップデート: {col}列を追加します")
+                c.execute(f"ALTER TABLE history ADD COLUMN {col} {dtype}")
+    except Exception as e:
+        print(f"DB Init Error: {e}")
+
     conn.close()
 
 # ==========================================
@@ -115,6 +128,9 @@ def report_worker():
             c.execute("SELECT * FROM history WHERE status='PENDING'")
             pending_races = c.fetchall()
             
+            if len(pending_races) > 0:
+                print(f"🔎 [Report] 結果確認中: {len(pending_races)}件")
+
             sess = requests.Session()
             updates = 0
             
@@ -127,21 +143,25 @@ def report_worker():
                     
                     if res:
                         pred_combo = race['predict_combo'] 
-                        
                         is_win = 0
                         profit = -BET_AMOUNT
                         actual_result = ""
                         payout = 0
                         
-                        # 結果判定
-                        if "-" in str(pred_combo): # 2連単
-                            actual_result = res['nirentan_combo']
-                            payout = res['nirentan_payout']
+                        # 結果抽出
+                        nirentan_res = res['nirentan_combo']
+                        nirentan_pay = res['nirentan_payout']
+                        tansho_res = res['tansho_boat']
+                        
+                        # 判定
+                        if "-" in str(pred_combo): # 2連単予想
+                            actual_result = nirentan_res
+                            payout = nirentan_pay
                             if str(pred_combo) == str(actual_result):
                                 is_win = 1
                                 profit = payout - BET_AMOUNT
-                        else: # 単勝
-                            actual_result = res['tansho_boat']
+                        else: # 単勝予想
+                            actual_result = tansho_res
                             payout = res['tansho_payout']
                             if str(pred_combo) == str(actual_result):
                                 is_win = 1
@@ -149,11 +169,12 @@ def report_worker():
 
                         if not actual_result: continue
 
+                        # ★修正: 単勝結果(result_tansho)もDBに記録
                         c.execute("""
                             UPDATE history 
-                            SET result_combo=?, is_win=?, payout=?, profit=?, status='FINISHED' 
+                            SET result_combo=?, is_win=?, payout=?, profit=?, status='FINISHED', result_tansho=?
                             WHERE race_id=?
-                        """, (actual_result, is_win, payout, profit, race['race_id']))
+                        """, (actual_result, is_win, payout, profit, tansho_res, race['race_id']))
                         updates += 1
                         
                         # 累計計算
@@ -162,8 +183,6 @@ def report_worker():
                         
                         place = PLACE_NAMES.get(jcd, "会場")
                         type_lbl = "2単" if "-" in str(pred_combo) else "単勝"
-                        # 単勝結果も表示
-                        tansho_res = res['tansho_boat'] if res['tansho_boat'] else "?"
                         
                         msg = (f"{'🎊 的中' if is_win else '💀 外れ'} {place}{rno}R ({type_lbl})\n"
                                f"予測:{pred_combo} → 結果:{actual_result} (単:{tansho_res})\n"
@@ -175,6 +194,25 @@ def report_worker():
                     time.sleep(1)
                 except: continue
             
+            if updates > 0: print(f"✅ [Report] {updates}件更新")
+
+            # 定期報告
+            current_key = f"{today}_{now.hour}"
+            if now.hour in REPORT_HOURS and last_report_key != current_key:
+                c.execute("SELECT count(*), sum(is_win), sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
+                cnt, wins, profit = c.fetchone()
+                c.execute("SELECT count(*) FROM history WHERE status='PENDING'")
+                pending_cnt = c.fetchone()[0]
+                
+                status_emoji = "🟢" if pending_cnt > 0 else "💤"
+                msg = (f"**🛠️ {now.hour}時の定期報告**\n"
+                       f"✅ 判明: {cnt or 0}R (的中: {wins or 0})\n"
+                       f"⏳ 待ち: {pending_cnt or 0}R\n"
+                       f"💵 本日収支: {'+' if (profit or 0)>0 else ''}{profit or 0}円")
+                send_discord(msg)
+                print(f"📢 [Report] 送信: {now.hour}時")
+                last_report_key = current_key
+
             conn.close()
         except Exception as e:
             print(f"🔥 [Report] Error: {e}")
@@ -223,7 +261,7 @@ def process_prediction(jcd, today, notified_ids, bst):
     sess = requests.Session()
     now = datetime.datetime.now(JST)
     
-    # ★追加: 通知用・現在の累計収支を取得
+    # 現在の累計収支を取得
     conn_temp = get_db_connection()
     c_temp = conn_temp.cursor()
     c_temp.execute("SELECT sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
@@ -344,13 +382,12 @@ def main():
         current_daily_profit = 0
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-            # daily_profitも受け取る
             futures = [executor.submit(process_prediction, jcd, today, notified_ids, bst) for jcd in range(1, 25)]
             for f in concurrent.futures.as_completed(futures):
                 try: 
                     res, profit = f.result()
                     new_preds.extend(res)
-                    current_daily_profit = profit # 最後のが入るが、同時実行なので概算
+                    current_daily_profit = profit
                 except: pass
         
         if new_preds:
@@ -361,10 +398,17 @@ def main():
                     now_str = datetime.datetime.now(JST).strftime('%H:%M:%S')
                     place = PLACE_NAMES.get(pred['jcd'], "不明")
                     
-                    # ★修正: best_boat (pred['best_boat']) をDBに保存
-                    # status="PENDING", best_boat=str(pred['best_boat'])
-                    c.execute("INSERT OR IGNORE INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (pred['id'], pred['date'], now_str, place, pred['rno'], pred['combo'], float(pred['prob']), pred['comment'], "", 0, 0, 0, "PENDING", str(pred['best_boat'])))
+                    # ★修正: 追加した列 (best_boat, odds, result_tansho) に対応したINSERT
+                    # result_tanshoはまだないので空文字
+                    c.execute("""
+                        INSERT OR IGNORE INTO history 
+                        (race_id, date, time, place, race_no, predict_combo, predict_prob, gemini_comment, 
+                         result_combo, is_win, payout, profit, status, best_boat, odds_tansho, odds_nirentan, result_tansho)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        pred['id'], pred['date'], now_str, place, pred['rno'], pred['combo'], float(pred['prob']), pred['comment'], 
+                        "", 0, 0, 0, "PENDING", str(pred['best_boat']), pred['odds']['tansho'], pred['odds']['nirentan'], ""
+                    ))
                     
                     t_disp = f"(締切 {pred['deadline']})" if pred['deadline'] else ""
                     odds_url = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={pred['rno']}&jcd={pred['jcd']:02d}&hd={pred['date']}"
@@ -374,7 +418,6 @@ def main():
                     
                     type_str = "2単" if "-" in str(pred['combo']) else "単勝"
 
-                    # ★修正: 累計収支を表示
                     msg = (f"🔥 **{place}{pred['rno']}R** {t_disp}\n"
                            f"🛶 本命: {pred['best_boat']}号艇\n"
                            f"🎯 推奨: {pred['combo']} ({type_str}/率:{pred['prob']:.0%})\n"
