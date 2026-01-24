@@ -116,14 +116,12 @@ def report_worker():
             conn = get_db_connection()
             c = conn.cursor()
             
-            # ★修正: DBにある「PENDING（結果待ち）」のレースだけを取得
-            # 今までのバグでstatus=0になっているものも救済する場合は OR status='0' をつけるが
-            # 新規データは正しくPENDINGになるため、ここでは標準ロジックにする
+            # ★修正: 日付指定を削除し、過去分も含めて全てのPENDINGをチェックする
             c.execute("SELECT * FROM history WHERE status='PENDING'")
             pending_races = c.fetchall()
             
             if len(pending_races) > 0:
-                print(f"🔎 [Report] 結果待ち確認中: {len(pending_races)}件")
+                print(f"🔎 [Report] 結果待ち確認中: {len(pending_races)}件 (全期間)")
             
             sess = requests.Session()
             updates = 0
@@ -137,26 +135,48 @@ def report_worker():
                     # 結果スクレイピング
                     res = scrape_result(sess, jcd, rno, date_str)
                     
-                    # 結果が出ていれば更新
                     if res:
-                        is_win = 1 if race['predict_combo'] == res['combo'] else 0
-                        profit = (res['payout'] - BET_AMOUNT) if is_win else -BET_AMOUNT
+                        # 予測が「単勝」か「2連単」かで判定を変える
+                        pred_combo = race['predict_combo'] # "1" or "1-2"
                         
-                        c.execute("""
-                            UPDATE history 
-                            SET result_combo=?, is_win=?, payout=?, profit=?, status='FINISHED' 
-                            WHERE race_id=?
-                        """, (res['combo'], is_win, res['payout'], profit, race['race_id']))
-                        
+                        is_win = 0
+                        profit = -BET_AMOUNT
+                        actual_result = ""
+                        payout = 0
+
+                        if "-" in str(pred_combo):
+                            # 2連単予想の場合
+                            actual_result = res['nirentan_combo']
+                            payout = res['nirentan_payout']
+                            if pred_combo == actual_result:
+                                is_win = 1
+                                profit = payout - BET_AMOUNT
+                        else:
+                            # 単勝予想の場合
+                            actual_result = res['tansho_boat']
+                            payout = res['tansho_payout']
+                            if str(pred_combo) == str(actual_result):
+                                is_win = 1
+                                profit = payout - BET_AMOUNT
+
+                        # 結果がまだ発表されていない場合（ヌル等のチェック）
+                        if not actual_result:
+                            continue
+
+                        c.execute("UPDATE history SET result_combo=?, is_win=?, payout=?, profit=?, status='FINISHED' WHERE race_id=?",
+                                  (actual_result, is_win, payout, profit, race['race_id']))
                         updates += 1
                         
                         place = PLACE_NAMES.get(jcd, "会場")
-                        msg = (f"{'🎊 的中' if is_win else '💀 外れ'} {place}{rno}R\n"
-                               f"予測:{race['predict_combo']} → 結果:{res['combo']}\n"
+                        type_lbl = "2単" if "-" in str(pred_combo) else "単勝"
+                        
+                        msg = (f"{'🎊 的中' if is_win else '💀 外れ'} {place}{rno}R ({type_lbl})\n"
+                               f"予測:{pred_combo} → 結果:{actual_result}\n"
                                f"収支:{'+' if profit>0 else ''}{profit}円")
                         send_discord(msg)
-                        print(f"📊 [Report] 結果判明: {place}{rno}R")
-                        time.sleep(1) 
+                        print(f"📊 [Report] 判明: {place}{rno}R")
+                    
+                    time.sleep(1) # 負荷軽減
                 except: continue
             
             if updates > 0:
@@ -178,8 +198,8 @@ def report_worker():
                 
                 status_emoji = "🟢" if (pending_cnt > 0) else "💤"
                 msg = (f"**🛠️ {now.hour}時の定期報告**\n"
-                       f"✅ 結果判明: {cnt or 0}R (的中: {wins or 0})\n"
-                       f"⏳ 結果待ち: {pending_cnt or 0}R\n"
+                       f"✅ 本日判明: {cnt or 0}R (的中: {wins or 0})\n"
+                       f"⏳ 結果待ち: {pending_cnt or 0}R (過去分含む)\n"
                        f"💵 本日収支: {'+' if (profit or 0)>0 else ''}{profit or 0}円")
                 
                 send_discord(msg)
@@ -226,8 +246,7 @@ def is_target_race(deadline_str, now_dt):
 def get_odds_with_retry(sess, jcd, rno, today, best_b, combo):
     for _ in range(3):
         odds_data = scrape_odds(sess, jcd, rno, today, target_boat=str(best_b), target_combo=combo)
-        if odds_data['tansho'] != "---" or odds_data['nirentan'] != "---":
-            return odds_data
+        if odds_data['tansho'] != "---": return odds_data
         time.sleep(2)
     return {"tansho": "1.0", "nirentan": "1.0"}
 
@@ -240,18 +259,15 @@ def process_prediction(jcd, today, notified_ids, bst):
     for rno in range(1, 13):
         rid = f"{today}_{str(jcd).zfill(2)}_{rno}"
         
-        # 通知済み または 無視リスト入りならスキップ
         if rid in notified_ids or rid in IGNORE_RACES: continue
         
         try:
             raw = scrape_race_data(sess, jcd, rno, today)
             
             if not raw:
-                IGNORE_RACES.add(rid) 
-                continue
+                IGNORE_RACES.add(rid); continue
             if not is_target_race(raw.get('deadline_time'), now):
-                IGNORE_RACES.add(rid)
-                continue
+                IGNORE_RACES.add(rid); continue
             
             df = engineer_features(pd.DataFrame([raw]))
             cols = ['jcd', 'rno', 'wind', 'wr_1_vs_avg']
@@ -264,44 +280,61 @@ def process_prediction(jcd, today, notified_ids, bst):
             best_idx = np.argmax(probs)
             combo, prob = COMBOS[best_idx], probs[best_idx]
 
-            if prob >= THRESHOLD_NIRENTAN or win_p[best_b] >= THRESHOLD_TANSHO:
+            # ★修正: どの券種で勝負するか決定
+            target_prediction = None
+            target_prob = 0.0
+            prediction_type = "" # "tansho" or "nirentan"
+
+            # 2連単の判定
+            if prob >= THRESHOLD_NIRENTAN:
+                target_prediction = combo
+                target_prob = prob
+                prediction_type = "nirentan"
+            # 単勝の判定 (2連単がダメでも単勝が良いなら)
+            elif win_p[best_b] >= THRESHOLD_TANSHO:
+                target_prediction = str(best_b)
+                target_prob = win_p[best_b]
+                prediction_type = "tansho"
+
+            if target_prediction:
                 place = PLACE_NAMES.get(jcd, "会場")
-                print(f"🎯 [Main] 候補発見: {place}{rno}R (Model:{win_p[best_b]:.0%}) -> オッズ確認")
+                print(f"🎯 [Main] 候補: {place}{rno}R ({prediction_type}) -> オッズ確認")
                 
                 odds_data = get_odds_with_retry(sess, jcd, rno, today, best_b, combo)
-                real_odds = extract_odds_value(odds_data['tansho'])
+                
+                # 期待値計算
+                real_odds = 1.0
+                if prediction_type == "nirentan":
+                    real_odds = extract_odds_value(odds_data['nirentan'])
+                else:
+                    real_odds = extract_odds_value(odds_data['tansho'])
+                
                 if real_odds == 0: real_odds = 1.0
-                expected_value = real_odds * win_p[best_b]
+                expected_value = real_odds * target_prob
                 
                 print(f"💰 [Main] 期待値: {expected_value:.2f}")
 
                 prompt = f"""
-                あなたはボートレースの投資アルゴリズムです。以下の数値に基づき判断してください。
-                
-                【データ】
-                ・算出された期待値(EV): {expected_value:.2f}
-                ・基準: EVが1.0以上なら「利益見込みあり」、1.0未満なら「期待値不足」
-                
-                【指示】
-                1. 結論は必ず「買い」または「見（ケン）」のどちらかで始めてください。
-                2. EVが1.0未満の場合は、必ず「見」としてください。
-                3. EVが1.0以上の場合は「買い」としてください。
-                4. 理由は40文字以内で簡潔に述べてください。
+                あなたはボートレース投資AIです。
+                【データ】EV: {expected_value:.2f} (基準1.0)
+                【指示】EV1.0以上なら「買い」、未満なら「見（ケン）」。
+                理由は40文字以内。
                 """
-                
                 comment = call_groq_api(prompt)
                 
                 pred_list.append({
                     'id': rid, 'jcd': jcd, 'rno': rno, 'date': today, 
-                    'combo': combo, 'prob': prob, 'best_boat': best_b, 
-                    'win_prob': win_p[best_b], 'comment': comment, 
+                    'combo': target_prediction, # ここに "1-2" または "1" が入る
+                    'prob': target_prob,
+                    'best_boat': best_b, 
+                    'win_prob': win_p[best_b], # 参考用
+                    'comment': comment, 
                     'deadline': raw.get('deadline_time'),
                     'odds': odds_data,
                     'ev': expected_value
                 })
             else:
                 IGNORE_RACES.add(rid)
-
         except: continue
     return pred_list
 
@@ -311,40 +344,28 @@ def main():
     
     if not os.path.exists(MODEL_FILE):
         if not os.path.exists(ZIP_MODEL):
-            if os.path.exists('model_part_1') or os.path.exists('model_part_01'):
-                print("📦 分割モデルを結合中...")
+            if os.path.exists('model_part_1'):
                 with open(ZIP_MODEL, 'wb') as f_out:
                     for i in range(1, 20):
-                        part_name = f'model_part_{i}'
-                        if not os.path.exists(part_name): part_name = f'model_part_{i:02d}'
-                        if os.path.exists(part_name):
-                            with open(part_name, 'rb') as f_in: f_out.write(f_in.read())
+                        p = f'model_part_{i}' if os.path.exists(f'model_part_{i}') else f'model_part_{i:02d}'
+                        if os.path.exists(p): 
+                            with open(p, 'rb') as f_in: f_out.write(f_in.read())
                         else: break
         if os.path.exists(ZIP_MODEL):
-            print("📦 モデルを解凍中...")
             with zipfile.ZipFile(ZIP_MODEL, 'r') as f: f.extractall()
     
     try: bst = lgb.Booster(model_file=MODEL_FILE)
-    except Exception as e:
-        print(f"🔥 モデル読み込み失敗: {e}")
-        return
+    except: return
 
     t = threading.Thread(target=report_worker, daemon=True)
     t.start()
-
     start_ts = time.time()
 
     while True:
         now = datetime.datetime.now(JST)
         today = now.strftime('%Y%m%d')
-        
-        if now.hour >= 23 and now.minute >= 10:
-            print("🌙 業務終了 (23:10)")
-            break
-
-        if time.time() - start_ts > 21000:
-            print("🛑 タイムリミット (再起動待機)")
-            break
+        if now.hour >= 23 and now.minute >= 10: break
+        if time.time() - start_ts > 21000: break
 
         conn = get_db_connection()
         c = conn.cursor()
@@ -364,45 +385,39 @@ def main():
         if new_preds:
             conn = get_db_connection()
             c = conn.cursor()
-            
             for pred in new_preds:
                 try:
                     now_str = datetime.datetime.now(JST).strftime('%H:%M:%S')
                     place = PLACE_NAMES.get(pred['jcd'], "不明")
-                    
-                    # ★修正: 列ズレを解消 (PENDINGを正しいstatus列へ)
-                    # result_combo="" (9), is_win=0 (10), payout=0 (11), profit=0 (12), status="PENDING" (13)
+                    # predict_comboには "1-2" または "1" が入る
                     c.execute("INSERT OR IGNORE INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (pred['id'], pred['date'], now_str, place, pred['rno'], pred['combo'], float(pred['prob']), pred['comment'], "", 0, 0, 0, "PENDING"))
                     
-                    print(f"💾 [DB] 登録完了: {pred['id']}")
-
                     t_disp = f"(締切 {pred['deadline']})" if pred['deadline'] else ""
                     odds_url = f"https://www.boatrace.jp/owpc/pc/race/oddstf?rno={pred['rno']}&jcd={pred['jcd']:02d}&hd={pred['date']}"
+                    
                     odds_t = pred['odds'].get('tansho', '-')
                     odds_n = pred['odds'].get('nirentan', '-')
                     ev_val = pred.get('ev', 0.0)
+                    
+                    type_str = "2単" if "-" in str(pred['combo']) else "単勝"
 
                     msg = (f"🔥 **{place}{pred['rno']}R** {t_disp}\n"
-                           f"🛶 本命: {pred['best_boat']}号艇 (勝率:{pred['win_prob']:.0%})\n"
-                           f"🎯 推奨: {pred['combo']} (的中:{pred['prob']:.0%})\n"
+                           f"🛶 本命: {pred['best_boat']}号艇\n"
+                           f"🎯 推奨: {pred['combo']} ({type_str}/率:{pred['prob']:.0%})\n"
                            f"💰 オッズ: 単{odds_t} / 2単{odds_n}\n"
-                           f"📈 期待値: {ev_val:.2f} (1.0超で狙い目)\n"
+                           f"📈 期待値: {ev_val:.2f}\n"
                            f"━━━━━━━━━━━━━━\n"
                            f"🤖 **{pred['comment']}**\n"
                            f"━━━━━━━━━━━━━━\n"
-                           f"📊 [オッズ確認]({odds_url})")
+                           f"📊 [オッズ]({odds_url})")
                     send_discord(msg)
-                    print(f"✅ [Main] 通知送信: {place}{pred['rno']}R")
-                except Exception as e:
-                    print(f"🔥 [Main] Insert Error: {e}")
-
+                    print(f"✅ [Main] 通知: {place}{pred['rno']}R")
+                except: pass
             conn.close()
 
         elapsed = time.time() - start_ts
-        sleep_time = max(0, 180 - elapsed % 180)
-        print(f"⏳ [Main] 待機: {int(sleep_time)}秒")
-        time.sleep(sleep_time)
+        time.sleep(max(0, 180 - elapsed % 180))
 
 if __name__ == "__main__":
     main()
