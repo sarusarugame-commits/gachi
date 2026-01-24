@@ -20,18 +20,19 @@ from scraper import scrape_race_data, scrape_odds, scrape_result
 # ⚙️ 設定エリア
 # ==========================================
 DB_FILE = "race_data.db"
-BET_AMOUNT = 1000
+BET_AMOUNT = 1000  # 1点あたりの購入額
 
-# 自信のあるレースのみ通知（しきい値設定）
-THRESHOLD_NIRENTAN = 0.15
-THRESHOLD_TANSHO   = 0.40
+# 🤖 予測フィルター設定
+# モデルが過信気味なため、確率だけでなく「期待値(EV)」も条件に追加
+THRESHOLD_NIRENTAN = 0.15  # 2連単の確率しきい値
+THRESHOLD_TANSHO   = 0.40  # 単勝の確率しきい値
+MIN_EV             = 1.0   # 期待値しきい値（1.0未満は買わない）
 
 REPORT_HOURS = list(range(8, 24))
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-# ⚠️ モデル名は変更しません
-GROQ_MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
+# 日本語対応・指示従順性が高いモデルを指定
+GROQ_MODEL_NAME = "llama3-70b-8192" 
 
 MODEL_FILE = 'boat_model_nirentan.txt'
 ZIP_MODEL = 'model.zip'
@@ -149,11 +150,9 @@ def report_worker():
             c.execute("SELECT * FROM history WHERE status='PENDING'")
             pending_races = c.fetchall()
             
-            # レースごとにグルーピング
-            # キー: "YYYYMMDD_JJ_RR"
+            # レースごとにグルーピング (YYYYMMDD_JJ_RR をキーにする)
             races_by_id = defaultdict(list)
             for race in pending_races:
-                # race_id形式: "YYYYMMDD_JJ_RR_TYPE" -> "_TYPE" を除いた部分をキーにする
                 base_id = "_".join(race['race_id'].split('_')[:3])
                 races_by_id[base_id].append(race)
             
@@ -162,11 +161,11 @@ def report_worker():
             
             for base_id, race_list in races_by_id.items():
                 try:
-                    # 代表データの取得（どれも同じレースなので最初の要素を使う）
+                    # 代表データの取得
                     first_race = race_list[0]
                     date_str = first_race['date']
-                    jcd = PLACE_NAMES.get(int(first_race['place'])) if isinstance(first_race['place'], int) else 0 # DB保存時の形式によるが、placeは日本語名で保存されている場合とJCDの場合があるため注意
-                    # historyテーブルのplaceカラムには日本語が入っているため、race_idからJCDを復元
+                    
+                    # IDから会場コードとレース番号を復元
                     parts = base_id.split('_')
                     jcd_int = int(parts[1])
                     rno_int = int(parts[2])
@@ -174,7 +173,7 @@ def report_worker():
                     formatted_date = f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}"
                     place_name = PLACE_NAMES.get(jcd_int, "会場")
 
-                    # 結果スクレイピング（1レースにつき1回）
+                    # 結果スクレイピング
                     res = scrape_result(sess, jcd_int, rno_int, date_str)
                     
                     if not res: continue
@@ -191,36 +190,40 @@ def report_worker():
                     results_text = []
                     is_any_win = False
                     
-                    # グループ内の各チケット（単勝・2連単）を処理
+                    # グループ内の各チケットを処理
                     for race in race_list:
                         pred_combo = race['predict_combo'] 
                         is_win = 0
-                        profit = -BET_AMOUNT 
                         actual_result = ""
-                        payout = 0
+                        payout_per_100 = 0
                         type_lbl = ""
                         
                         if "-" in str(pred_combo): # 2連単
                             type_lbl = "2単"
                             actual_result = nirentan_res
-                            payout = nirentan_pay
-                            if str(pred_combo) == str(actual_result):
-                                is_win = 1
-                                profit = payout - BET_AMOUNT
+                            payout_per_100 = nirentan_pay
                         else: # 単勝
                             type_lbl = "単勝"
                             actual_result = tansho_res
-                            payout = tansho_pay
-                            if str(pred_combo) == str(actual_result):
-                                is_win = 1
-                                profit = payout - BET_AMOUNT
+                            payout_per_100 = tansho_pay
+
+                        # 勝敗判定と収支計算（ここを修正！）
+                        profit = -BET_AMOUNT # 外れの場合のデフォルト
+                        
+                        if str(pred_combo) == str(actual_result):
+                            is_win = 1
+                            # 払戻金計算: (オッズ × 購入額/100) - 購入額
+                            # 例: 230円 * (1000/100) - 1000 = 2300 - 1000 = +1300
+                            bet_ratio = BET_AMOUNT / 100
+                            return_amount = int(payout_per_100 * bet_ratio)
+                            profit = return_amount - BET_AMOUNT
                         
                         # DB更新
                         c.execute("""
                             UPDATE history 
                             SET result_combo=?, is_win=?, payout=?, profit=?, status='FINISHED', result_tansho=?
                             WHERE race_id=?
-                        """, (actual_result, is_win, payout, profit, tansho_res, race['race_id']))
+                        """, (actual_result, is_win, payout_per_100, profit, tansho_res, race['race_id']))
                         updates += 1
                         
                         race_profit += profit
@@ -234,14 +237,15 @@ def report_worker():
                     c.execute("SELECT sum(profit) FROM history WHERE date=? AND status='FINISHED'", (today,))
                     daily_profit = c.fetchone()[0] or 0
                     
-                    # まとめて通知
-                    msg = (f"📢 **{formatted_date} {place_name}{rno_int}R 結果**\n"
+                    # 通知
+                    header_icon = "🎉" if race_profit > 0 else "📢"
+                    msg = (f"{header_icon} **{formatted_date} {place_name}{rno_int}R 結果**\n"
                            f"🏁 結果: {nirentan_res} (単: {tansho_res})\n"
                            + "\n".join(results_text) + "\n"
                            f"💰 レース収支: {race_profit:+d}円\n"
                            f"📉 本日累計: {daily_profit:+d}円")
                     send_discord(msg)
-                    print(f"📊 [Report] 判明: {place_name}{rno_int}R")
+                    print(f"📊 [Report] 判明: {place_name}{rno_int}R 収支:{race_profit}")
                     
                     time.sleep(1)
                 except Exception as e:
@@ -335,36 +339,42 @@ def process_prediction(jcd, today, notified_ids, bst):
             if real_odds_t == 0: real_odds_t = 1.0
             if real_odds_n == 0: real_odds_n = 1.0
 
-            # 単勝
+            # --- 予測とフィルタリング ---
+            
+            # 1. 単勝 (確率 > 40% かつ EV > 1.0)
             if rid_tansho not in notified_ids and win_p[best_b] >= THRESHOLD_TANSHO:
                 ev_t = real_odds_t * win_p[best_b]
-                comment = call_groq_api(f"単勝{best_b}。期待値{ev_t:.2f}。")
                 
-                pred_list.append({
-                    'id': rid_tansho, 'jcd': jcd, 'rno': rno, 'date': today,
-                    'combo': str(best_b), 'prob': win_p[best_b], 'best_boat': best_b,
-                    'comment': comment, 'deadline': raw.get('deadline_time'),
-                    'odds': odds_data, 'ev': ev_t, 'type': '単勝'
-                })
+                # EVチェックを追加
+                if ev_t >= MIN_EV:
+                    comment = call_groq_api(f"単勝{best_b}。期待値{ev_t:.2f}。")
+                    pred_list.append({
+                        'id': rid_tansho, 'jcd': jcd, 'rno': rno, 'date': today,
+                        'combo': str(best_b), 'prob': win_p[best_b], 'best_boat': best_b,
+                        'comment': comment, 'deadline': raw.get('deadline_time'),
+                        'odds': odds_data, 'ev': ev_t, 'type': '単勝'
+                    })
 
-            # 2連単
+            # 2. 2連単 (確率 > 15% かつ EV > 1.0)
             if rid_nirentan not in notified_ids and prob >= THRESHOLD_NIRENTAN:
                 ev_n = real_odds_n * prob
-                comment = call_groq_api(f"2連単{combo}。期待値{ev_n:.2f}。")
-
-                pred_list.append({
-                    'id': rid_nirentan, 'jcd': jcd, 'rno': rno, 'date': today,
-                    'combo': combo, 'prob': prob, 'best_boat': best_b,
-                    'comment': comment, 'deadline': raw.get('deadline_time'),
-                    'odds': odds_data, 'ev': ev_n, 'type': '2単'
-                })
+                
+                # EVチェックを追加
+                if ev_n >= MIN_EV:
+                    comment = call_groq_api(f"2連単{combo}。期待値{ev_n:.2f}。")
+                    pred_list.append({
+                        'id': rid_nirentan, 'jcd': jcd, 'rno': rno, 'date': today,
+                        'combo': combo, 'prob': prob, 'best_boat': best_b,
+                        'comment': comment, 'deadline': raw.get('deadline_time'),
+                        'odds': odds_data, 'ev': ev_n, 'type': '2単'
+                    })
             
         except: continue
     
     return pred_list, current_daily_profit, f"{today[:4]}/{today[4:6]}/{today[6:]}"
 
 def main():
-    print(f"🚀 [Main] グループ通知Bot起動 (Model: {GROQ_MODEL_NAME})")
+    print(f"🚀 [Main] 収支計算修正版Bot起動 (Model: {GROQ_MODEL_NAME})")
     init_db()
     
     if not os.path.exists(MODEL_FILE):
@@ -418,7 +428,7 @@ def main():
             conn = get_db_connection()
             c = conn.cursor()
             
-            # 【変更】レースごとのグループ通知（購入時）
+            # レースごとのグループ通知（購入時）
             preds_by_race = defaultdict(list)
             for pred in new_preds:
                 preds_by_race[(pred['jcd'], pred['rno'])].append(pred)
@@ -453,7 +463,7 @@ def main():
                             f"🎫 **{type_str}**: {pred['combo']} (率:{pred['prob']:.0%} / オッズ:{odds_val} / EV:{ev_val:.2f})"
                         )
 
-                    # コメントは代表して1つだけ表示（または複数ある場合は結合）
+                    # コメントは代表して1つ
                     comment_disp = first_pred['comment']
 
                     msg = (f"🔥 **{formatted_date} {place_name}{rno}R** {t_disp}\n"
