@@ -2,13 +2,10 @@ name: Boat Race Bot
 
 on:
   schedule:
-    # ⏰ UTC時間で記述 (JST = UTC+9)
-    # JST 08:30 (UTC 23:30) - 朝〜昼
+    # JST 08:30 (UTC 23:30)
     - cron: '30 23 * * *'
-    # JST 14:30 (UTC 05:30) - 昼〜夕
+    # JST 14:30 (UTC 05:30)
     - cron: '30 5 * * *'
-    # JST 20:30 (UTC 11:30) - 夕〜ナイター終了
-    - cron: '30 11 * * *'
   workflow_dispatch:
 
 permissions:
@@ -32,30 +29,28 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy lightgbm requests beautifulsoup4
+          # requirements.txt があればそれを使う
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # なければ直接インストール
+          pip install pandas numpy lightgbm joblib requests beautifulsoup4 lxml
 
       - name: Run Bot
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python main.py
 
       - name: Force Save Database
-        # 正常終了時も、エラー時も必ず実行してデータを残す
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "bot@noreply.github.com"
-          
-          # コンフリクトを無視して、今回の実行結果を正とする
           git fetch origin main
           git reset origin/main
           git add race_data.db
-          
           if git diff --staged --quiet; then
-            echo "No changes to commit."
+            echo "No changes"
           else
-            git commit -m "Update race data [skip ci]"
+            git commit -m "Update DB [skip ci]"
             git push origin main
           fi
