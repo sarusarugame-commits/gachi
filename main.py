@@ -16,11 +16,9 @@ BET_AMOUNT = 1000
 PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
 JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 
-# 強制的にログを吐き出す設定
 sys.stdout.reconfigure(encoding='utf-8')
 
 def log(msg):
-    """バッファせずに即出力"""
     print(msg, flush=True)
 
 def send_discord(content):
@@ -64,38 +62,35 @@ def process_race(jcd, rno, today):
     sess = get_session()
     place = PLACE_NAMES[jcd]
     
-    # データを取得
     try:
         raw = scrape_race_data(sess, jcd, rno, today)
     except Exception as e:
         log(f"❌ {place}{rno}R: エラー {e}")
         return
 
-    # データチェック
     if not raw:
-        # データがない場合も表示（開催なしか、まだ公開前）
-        # log(f"💨 {place}{rno}R: データなし")
         return
     
     if raw.get('wr1', 0) == 0:
-        log(f"⚠️ {place}{rno}R: データ取得失敗 (勝率0.0) -> スキップ")
+        log(f"⚠️ {place}{rno}R: データ欠損 (勝率0.0)")
         return
     
-    # ★修正点：ここをコメントアウトせず表示します
-    log(f"✅ {place}{rno}R: データ取得成功 (1号艇勝率:{raw['wr1']} / モーター:{raw['mo1']})") 
+    # ★★★ ここ修正：全データを整形して吐き出させる ★★★
+    log(f"✅ {place}{rno}R [証明ログ] ----------------------------------")
+    log(f"   風速: {raw.get('wind')}m | 締切: {raw.get('deadline_time')}")
+    log(f"   1号艇: 勝率{raw['wr1']} / モーター{raw['mo1']} / ST{raw['st1']} / 展示{raw['ex1']}")
+    log(f"   2号艇: 勝率{raw['wr2']} / モーター{raw['mo2']} / ST{raw['st2']} / 展示{raw['ex2']}")
+    log(f"   3号艇: 勝率{raw['wr3']} / モーター{raw['mo3']} / ST{raw['st3']} / 展示{raw['ex3']}")
+    log(f"   4号艇: 勝率{raw['wr4']} / モーター{raw['mo4']} / ST{raw['st4']} / 展示{raw['ex4']}")
+    log(f"   5号艇: 勝率{raw['wr5']} / モーター{raw['mo5']} / ST{raw['st5']} / 展示{raw['ex5']}")
+    log(f"   6号艇: 勝率{raw['wr6']} / モーター{raw['mo6']} / ST{raw['st6']} / 展示{raw['ex6']}")
+    log(f"----------------------------------------------------------")
 
-    # 予測実行
     try:
         preds = predict_race(raw)
-    except Exception as e:
-        log(f"❌ {place}{rno}R: 予測エラー {e}")
-        return
+    except: return
 
-    # ★修正点：予測結果がなかった場合も理由を表示
-    if not preds:
-        # ログが多すぎる場合はここをコメントアウトしてください
-        # log(f"💀 {place}{rno}R: 条件不一致（スルー）")
-        return
+    if not preds: return
 
     conn = sqlite3.connect(DB_FILE)
     for p in preds:
@@ -103,14 +98,14 @@ def process_race(jcd, rno, today):
         exists = conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone()
         
         if not exists:
-            log(f"🔥 [HIT] {place}{rno}R 激熱！ -> {p['combo']}")
+            log(f"🔥 [HIT] {place}{rno}R -> {p['combo']}")
             conn.execute("INSERT INTO history VALUES (?,?,?,?,?,?,?)", (race_id, today, place, rno, p['combo'], 'PENDING', 0))
             conn.commit()
             send_discord(f"🔥 **{place}{rno}R** 推奨:[{p['type']}] {p['combo']} (実績期待値:{p['profit']}円)")
     conn.close()
 
 def main():
-    log("🚀 最強AI Bot (全ログ出力・デバッグ版) 起動")
+    log("🚀 最強AI Bot (データ全開示証明版) 起動")
     init_db()
     threading.Thread(target=report_worker, daemon=True).start()
     
@@ -118,7 +113,6 @@ def main():
         today = datetime.datetime.now(JST).strftime('%Y%m%d')
         log(f"⚡ Scan Start: {datetime.datetime.now(JST).strftime('%H:%M:%S')}")
         
-        # 高速並列処理
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             for jcd in range(1, 25):
                 for rno in range(1, 13):
