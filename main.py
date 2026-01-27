@@ -1,117 +1,125 @@
-from curl_cffi import requests
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-import re
-import unicodedata
-import warnings
+import os
+import datetime
+import time
+import sqlite3
+import concurrent.futures
+import threading
+import sys
+import requests as std_requests
 
-# ログ汚染対策
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+# 自作モジュール
+from scraper import scrape_race_data, scrape_odds, scrape_result, get_session
+from predict_boat import predict_race
 
-def clean_text(text):
-    if not text: return ""
-    text = unicodedata.normalize('NFKC', str(text))
-    return text.replace("\n", " ").replace("\r", "").strip()
+DB_FILE = "race_data.db"
+BET_AMOUNT = 1000 
+PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
+JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 
-def get_session():
-    # Chrome 120 の指紋を模倣（これで5KBブロックを突破）
-    return requests.Session(impersonate="chrome120")
+# 強制的にログを吐き出す設定
+sys.stdout.reconfigure(encoding='utf-8')
 
-def get_soup(session, url):
-    try:
-        res = session.get(url, timeout=15)
-        if res.status_code != 200:
-            return None
-        return BeautifulSoup(res.content, 'lxml')
-    except:
-        return None
+def log(msg):
+    """バッファせずに即出力"""
+    print(msg, flush=True)
 
-def extract_win_rate(text):
-    matches = re.findall(r"(\d\.\d{2})", text)
-    for m in matches:
-        val = float(m)
-        if 1.5 <= val <= 9.99: return val
-    return 0.0
+def send_discord(content):
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if url: 
+        try:
+            std_requests.post(url, json={"content": content}, timeout=10)
+        except: pass
 
-def scrape_race_data(session, jcd, rno, date_str):
-    base_url = "https://www.boatrace.jp/owpc/pc/race"
-    url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    url_list = f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("CREATE TABLE IF NOT EXISTS history (race_id TEXT PRIMARY KEY, date TEXT, place TEXT, race_no INTEGER, predict_combo TEXT, status TEXT, profit INTEGER)")
+    conn.close()
 
-    soup_before = get_soup(session, url_before)
-    soup_list = get_soup(session, url_list)
+def report_worker():
+    while True:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            conn.row_factory = sqlite3.Row
+            pending = conn.execute("SELECT * FROM history WHERE status='PENDING'").fetchall()
+            sess = get_session()
+            for p in pending:
+                try: jcd = int(p['race_id'].split('_')[1])
+                except: continue
+                
+                res = scrape_result(sess, jcd, p['race_no'], p['date'])
+                if res and res['nirentan_combo']:
+                    hit = (p['predict_combo'] == res['nirentan_combo'])
+                    payout = res['nirentan_payout'] * (BET_AMOUNT/100) if hit else 0
+                    profit = int(payout - BET_AMOUNT)
+                    conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, p['race_id']))
+                    conn.commit()
+                    icon = "🎯" if hit else "💀"
+                    send_discord(f"{icon} **{p['place']}{p['race_no']}R** 予想:{p['predict_combo']} 収支:{profit:+d}円")
+            conn.close()
+        except Exception as e:
+            log(f"⚠️ Report Worker Error: {e}")
+        time.sleep(600)
+
+def process_race(jcd, rno, today):
+    sess = get_session()
+    place = PLACE_NAMES[jcd]
     
-    if not soup_before or not soup_list: return None
-    if "データがありません" in soup_before.text: return None
-
-    row = {'date': date_str, 'jcd': jcd, 'rno': rno}
-    row['deadline_time'] = "23:59"
-
-    # 締切時刻
+    # データを取得
     try:
-        target = soup_list.find(lambda t: t.name in ['th','td'] and "締切予定時刻" in t.text)
-        if target:
-            cells = target.find_parent("tr").find_all(['th','td'])
-            if len(cells) > rno:
-                m = re.search(r"(\d{1,2}:\d{2})", clean_text(cells[rno].text))
-                if m: row['deadline_time'] = m.group(1)
-    except: pass
+        raw = scrape_race_data(sess, jcd, rno, today)
+    except Exception as e:
+        log(f"❌ {place}{rno}R: エラー {e}")
+        return
 
-    # 風速
+    # ★ここが重要：取得状況を必ずログに出す（沈黙させない）
+    if not raw:
+        # log(f"💨 {place}{rno}R: データなし(開催外or未公開)")
+        return
+    
+    if raw.get('wr1', 0) == 0:
+        log(f"⚠️ {place}{rno}R: データ取得失敗 (勝率0.0) -> スキップ")
+        return
+    
+    # 正常に取れた場合のみ、ここを通る
+    # log(f"✅ {place}{rno}R: 取得成功 (1号艇勝率: {raw['wr1']})") 
+
+    # 予測実行
     try:
-        w_node = soup_before.select_one(".weather1_bodyUnitLabelData")
-        m = re.search(r"(\d+)m", clean_text(w_node.text)) if w_node else None
-        row['wind'] = float(m.group(1)) if m else 0.0
-    except: row['wind'] = 0.0
+        preds = predict_race(raw)
+    except: return
 
-    # 各艇データ
-    for i in range(1, 7):
-        try:
-            # 展示タイム
-            node_b = soup_before.select_one(f"td.is-boatColor{i}")
-            tr_b = node_b.find_parent("tr")
-            ex_val = clean_text(tr_b.select("td")[4].text)
-            row[f'ex{i}'] = float(re.search(r"(\d\.\d{2})", ex_val).group(1))
-        except: row[f'ex{i}'] = 6.80
+    if not preds: return
 
-        try:
-            # 勝率・ST・モーター
-            node_l = soup_list.select_one(f"td.is-boatColor{i}")
-            tbody = node_l.find_parent("tbody")
-            full_txt = clean_text(tbody.text)
-            
-            row[f'wr{i}'] = extract_win_rate(full_txt)
-            
-            m_st = re.search(r"ST(\.\d{2}|\d\.\d{2})", full_txt.replace(" ", ""))
-            if m_st:
-                val = m_st.group(1)
-                row[f'st{i}'] = float(val) if val.startswith("0") or val.startswith(".") else 0.20
-            else: row[f'st{i}'] = 0.20
-            if row[f'st{i}'] < 0: row[f'st{i}'] = 0.20 # フライング補正
+    conn = sqlite3.connect(DB_FILE)
+    for p in preds:
+        race_id = f"{today}_{jcd}_{rno}_{p['combo']}"
+        exists = conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone()
+        
+        if not exists:
+            log(f"🔥 [HIT] {place}{rno}R 激熱！ -> {p['combo']}")
+            conn.execute("INSERT INTO history VALUES (?,?,?,?,?,?,?)", (race_id, today, place, rno, p['combo'], 'PENDING', 0))
+            conn.commit()
+            send_discord(f"🔥 **{place}{rno}R** 推奨:[{p['type']}] {p['combo']} (実績期待値:{p['profit']}円)")
+    conn.close()
 
-            m_mo = re.findall(r"(\d{2}\.\d)", full_txt)
-            valid_mo = [float(x) for x in m_mo if float(x) > 10.0]
-            row[f'mo{i}'] = valid_mo[0] if valid_mo else 30.0
-        except:
-            row[f'wr{i}'], row[f'st{i}'], row[f'mo{i}'] = 0.0, 0.20, 30.0
+def main():
+    log("🚀 最強AI Bot (完全版) 起動")
+    init_db()
+    threading.Thread(target=report_worker, daemon=True).start()
+    
+    while True:
+        today = datetime.datetime.now(JST).strftime('%Y%m%d')
+        log(f"⚡ Scan Start: {datetime.datetime.now(JST).strftime('%H:%M:%S')}")
+        
+        # 高速並列処理
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            for jcd in range(1, 25):
+                for rno in range(1, 13):
+                    ex.submit(process_race, jcd, rno, today)
+        
+        # ループ終了時にログを吐く
+        log("💤 スキャン完了。5分待機...")
+        time.sleep(300)
 
-    return row
-
-def scrape_result(session, jcd, rno, date_str):
-    url = f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    soup = get_soup(session, url)
-    if not soup or "データがありません" in soup.text: return None
-    res = {"nirentan_combo": None, "nirentan_payout": 0}
-    try:
-        for row in soup.select("tr"):
-            txt = clean_text(row.text)
-            if "2連単" in txt:
-                nums = row.select(".numberSet1_number")
-                if len(nums) >= 2:
-                    res["nirentan_combo"] = f"{nums[0].text}-{nums[1].text}"
-                pay = row.select_one(".is-payout1")
-                if pay: res["nirentan_payout"] = int(pay.text.replace("¥","").replace(",",""))
-    except: pass
-    return res
-
-def scrape_odds(session, jcd, rno, date_str, target_boat=None, target_combo=None):
-    return {"tansho": "1.0", "nirentan": "1.0"}
+if __name__ == "__main__":
+    main()
