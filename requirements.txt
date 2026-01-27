@@ -2,7 +2,6 @@ pandas
 numpy
 lightgbm
 joblib
-requests
 beautifulsoup4
 lxml
-google-generativeai
+curl_cffi
