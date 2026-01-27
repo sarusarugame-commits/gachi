@@ -1,9 +1,13 @@
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning # 変更点
 import re
 import unicodedata
+import warnings # 変更点
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
+
+# ⚠️ 警告を無視する設定を追加（これでログが静かになります）
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 def clean_text(text):
     if not text: return ""
@@ -14,6 +18,11 @@ def extract_all_numbers(text):
     """テキストから全ての数値を抽出する"""
     if not text: return []
     return re.findall(r"(\d+\.\d+|\d+)", text)
+
+def extract_float(text):
+    if not text: return 0.0
+    match = re.search(r"(\d+\.?\d*)", clean_text(text))
+    return float(match.group(1)) if match else 0.0
 
 def get_session():
     session = requests.Session()
@@ -28,6 +37,7 @@ def get_soup(session, url):
     try:
         res = session.get(url, timeout=15)
         res.encoding = res.apparent_encoding
+        # 警告対策済み
         return BeautifulSoup(res.text, 'lxml') if res.status_code == 200 else None
     except: return None
 
@@ -55,9 +65,7 @@ def scrape_race_data(session, jcd, rno, date_str):
     for i in range(1, 7):
         # --- 展示タイム (beforeinfo) ---
         try:
-            # 艇番の色が付いたセルを起点に、展示タイムがある5番目のtdを探す
             boat_node = soup_before.select_one(f"td.is-boatColor{i}")
-            # 展示タイムは通常、その行の5番目のtd（index 4）
             ex_val = boat_node.find_parent("tr").select("td")[4].text
             row[f'ex{i}'] = float(re.search(r"(\d\.\d{2})", ex_val).group(1))
         except: row[f'ex{i}'] = 6.80
@@ -68,28 +76,20 @@ def scrape_race_data(session, jcd, rno, date_str):
             tbody = list_node.find_parent("tbody")
             tds = tbody.select("td")
             
-            # 全国勝率 (通常、3行あるうちの1行目の特定の場所)
-            # 全体のテキストから勝率（X.XX）とモーター勝率を慎重に探す
-            all_txt = clean_text(tbody.text)
-            
-            # 全国勝率: 「全国」という文字の後の数値を取得
             wr_cell = tds[3].get_text(separator=' ')
             wr_nums = extract_all_numbers(wr_cell)
             row[f'wr{i}'] = float(wr_nums[0]) if wr_nums else 0.0
             
-            # 平均ST: ST0.XX という形式を探す
+            all_txt = clean_text(tbody.text)
             st_match = re.search(r"ST(\d\.\d{2})", all_txt.replace(" ", ""))
             row[f'st{i}'] = float(st_match.group(1)) if st_match else 0.17
             
-            # モーター勝率: モーター番号(2桁)の後の勝率(2桁.2桁)を取得
             mo_cell = tds[5].get_text(separator=' ')
             mo_nums = extract_all_numbers(mo_cell)
-            # mo_numsは [モーター番号, モーター勝率] になるはずなので、2番目を取る
             row[f'mo{i}'] = float(mo_nums[1]) if len(mo_nums) >= 2 else 30.0
         except:
             row[f'wr{i}'], row[f'st{i}'], row[f'mo{i}'] = 0.0, 0.20, 30.0
 
-    # 締切時刻の取得（main.pyでの判定用）
     try:
         deadline_time = "23:59"
         target_label = soup_list.find(lambda tag: "締切予定時刻" in tag.text)
