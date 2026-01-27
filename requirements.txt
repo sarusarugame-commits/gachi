@@ -5,3 +5,4 @@ joblib
 beautifulsoup4
 lxml
 curl_cffi
+requests
