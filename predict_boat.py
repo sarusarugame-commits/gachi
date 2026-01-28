@@ -3,15 +3,18 @@ import numpy as np
 import lightgbm as lgb
 import joblib
 import os
+import re
 import traceback
 from groq import Groq
 
 MODEL_FILE = 'ultimate_boat_model.pkl'
 STRATEGY_FILE = 'ultimate_winning_strategies.csv'
 
-# ★強制通知設定
-MIN_PROFIT = -999999 
-MIN_ROI = 0       
+# ==========================================
+# ⚙️ 本番運用設定 (足切りライン)
+# ==========================================
+MIN_PROFIT = 1000   # 期待値1000円以上のみ通知
+MIN_ROI = 110       # 回収率110%以上のみ通知
 
 # Groq設定
 GROQ_URL = "https://api.groq.com/openai/v1"
@@ -57,7 +60,7 @@ def ask_groq_reason(row, combo, ptype):
     except Exception as e:
         return f"AI解説エラー: {str(e)}"
 
-# 再帰的クリーニング (入力データ用)
+# 再帰的クリーニング
 def unwrap_value(v):
     if isinstance(v, (list, tuple, np.ndarray)):
         if len(v) == 0: return 0.0
@@ -126,31 +129,23 @@ def predict_race(raw_data):
             else:
                 df_final[f] = 0.0
         
-        # NumPy配列(float32)に変換
+        # NumPy配列(float32)に変換して予測
         X = df_final.values.astype(np.float32)
         
-        # 予測実行 (安全化ロジック適用)
         try:
-            # 内部ヘルパー関数: 安全に予測結果を取得する
+            # 内部ヘルパー関数
             def safe_predict_idx(model, input_x):
-                # 1. predict_proba が使えるか試す (分類モデルの場合)
                 try:
                     proba = model.predict_proba(input_x)
                     return np.argmax(proba, axis=1)[0]
                 except:
                     pass
                 
-                # 2. predict を使う
                 pred = model.predict(input_x)
-                
-                # pred が2次元配列かつ列数が複数ある場合は確率とみなす
                 if hasattr(pred, 'ndim') and pred.ndim == 2 and pred.shape[1] > 1:
                     return np.argmax(pred, axis=1)[0]
                 
-                # スカラーまたは1次元配列の場合
                 val = pred[0]
-                
-                # 値が配列の場合の処理 (これがエラーの主原因)
                 if hasattr(val, 'ndim') and val.ndim > 0:
                     if val.size == 1:
                         val = val.item()
@@ -170,58 +165,79 @@ def predict_race(raw_data):
 
         except Exception as inner_e:
             print(f"⚠️ Internal Predict Error: {inner_e}")
-            # 万が一の最終バックアップ
-            p1_idx = int(models['r1'].predict(X).flat[0]) - 1
-            p2_idx = int(models['r2'].predict(X).flat[0]) - 1
-            p3_idx = int(models['r3'].predict(X).flat[0]) - 1
+            return []
 
         p1, p2, p3 = p1_idx + 1, p2_idx + 1, p3_idx + 1
         
     except Exception as e:
         print(f"⚠️ AI Prediction Error: {e}", flush=True)
-        # traceback.print_exc()
         return [] 
 
     # ---------------------------------------------------------
-    # 2. 買い目作成
+    # 2. 買い目作成とフィルタリング (本番ロジック)
     # ---------------------------------------------------------
     form_3t = f"{p1}-{p2}-{p3}"
     form_2t = f"{p1}-{p2}"
     
-    profit, prob, roi = 9999, 99.9, 999 
-    
+    # 戦略ファイルを読み込み
+    strategies = None
     try:
         if os.path.exists(STRATEGY_FILE):
             strategies = pd.read_csv(STRATEGY_FILE)
+    except:
+        pass
+
+    # ★ 3連単フィルタリング
+    if p1 != p2 and p1 != p3 and p2 != p3:
+        profit, prob, roi = 0, 0, 0
+        valid = False
+        
+        # CSVから実績データを取得
+        if strategies is not None:
             match = strategies[(strategies['券種'] == '3連単') & (strategies['買い目'] == form_3t)]
             if not match.empty:
                 profit = int(match.iloc[0]['収支'])
                 prob = match.iloc[0]['的中率']
                 roi = match.iloc[0]['回収率']
-    except: pass 
+                # 条件チェック
+                if profit >= MIN_PROFIT and roi >= MIN_ROI:
+                    valid = True
+        
+        # 条件を満たす場合のみ通知リストへ
+        if valid:
+            reason = ask_groq_reason(clean_data, form_3t, "3連単")
+            recommendations.append({
+                'type': '3連単',
+                'combo': form_3t,
+                'prob': prob,
+                'profit': profit,
+                'roi': roi,
+                'reason': reason
+            })
 
-    # ★ 3連単
-    if p1 != p2 and p1 != p3 and p2 != p3:
-        reason = ask_groq_reason(clean_data, form_3t, "3連単")
-        recommendations.append({
-            'type': '3連単',
-            'combo': form_3t,
-            'prob': prob,
-            'profit': profit,
-            'roi': roi,
-            'reason': reason
-        })
-
-    # ★ 2連単
+    # ★ 2連単フィルタリング
     if p1 != p2:
-        reason = ask_groq_reason(clean_data, form_2t, "2連単")
-        recommendations.append({
-            'type': '2連単',
-            'combo': form_2t,
-            'prob': 80.0,
-            'profit': 2000,
-            'roi': 120,
-            'reason': reason
-        })
+        profit, prob, roi = 0, 0, 0
+        valid = False
+        
+        if strategies is not None:
+            match = strategies[(strategies['券種'] == '2連単') & (strategies['買い目'] == form_2t)]
+            if not match.empty:
+                profit = int(match.iloc[0]['収支'])
+                prob = match.iloc[0]['的中率']
+                roi = match.iloc[0]['回収率']
+                if profit >= MIN_PROFIT and roi >= MIN_ROI:
+                    valid = True
+        
+        if valid:
+            reason = ask_groq_reason(clean_data, form_2t, "2連単")
+            recommendations.append({
+                'type': '2連単',
+                'combo': form_2t,
+                'prob': prob,
+                'profit': profit,
+                'roi': roi,
+                'reason': reason
+            })
             
     return recommendations
