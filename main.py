@@ -1,251 +1,180 @@
-import pandas as pd
-import numpy as np
-import lightgbm as lgb
-import joblib
 import os
-import requests # ★公式ライブラリ廃止、requestsを使用
+import datetime
 import time
+import sqlite3
+import concurrent.futures
+import threading
+import sys
+import requests as std_requests
 import json
-import traceback
+import pandas as pd
 
-MODEL_FILE = 'ultimate_boat_model.pkl'
-STRATEGY_FILE = 'ultimate_winning_strategies.csv'
+# 自作モジュール
+from scraper import scrape_race_data, get_session
+from predict_boat import predict_race
 
-# ==========================================
-# ⚙️ 本番運用設定
-# ==========================================
-MIN_PROFIT = 1000   
-MIN_ROI = 110       
+DB_FILE = "race_data.db"
+PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
+JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 
-# Groq設定
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-# ★モデル名は元のまま
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+sys.stdout.reconfigure(encoding='utf-8')
 
-def ask_groq_reason(row, combo, ptype):
-    api_key = os.environ.get("GROQ_API_KEY")
-    print(f"🤖 Groq API呼び出し(requests): {combo}...", flush=True)
-    
-    if not api_key: 
-        print("❌ Groq Error: APIキーなし", flush=True)
-        return "AI解説: (APIキー設定なし)"
-    
-    def safe_get(key):
-        try:
-            val = row.get(key, 0)
-            if isinstance(val, (list, np.ndarray)):
-                return val[0] if len(val) > 0 else 0
-            return val
-        except:
-            return 0
-        
-    data_str = (
-        f"1号艇:勝率{safe_get('wr1')}\n"
-        f"2号艇:勝率{safe_get('wr2')}\n"
-        f"3号艇:勝率{safe_get('wr3')}\n"
-        f"4号艇:勝率{safe_get('wr4')}\n"
-    )
-    prompt = f"買い目「{combo}」({ptype})を推奨する理由を、競艇のプロとして100文字以内で断言せよ。\nデータ:\n{data_str}"
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a professional boat race analyst. Answer in Japanese."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 150
-    }
+def log(msg):
+    print(msg, flush=True)
 
-    # リトライ処理
-    for attempt in range(3):
-        try:
-            # ★requestsで直接POST送信 (ライブラリ依存なし)
-            response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                content = data['choices'][0]['message']['content']
-                print(f"🤖 Groq応答成功", flush=True)
-                return content
-            else:
-                print(f"⚠️ Groq API Error {response.status_code}: {response.text}", flush=True)
-                time.sleep(2)
-                
-        except Exception as e:
-            print(f"⚠️ Groq Connection Error (Attempt {attempt+1}): {e}", flush=True)
-            time.sleep(2)
+def send_discord(content):
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url: return
 
-    return "AI解説: (通信エラー)"
-
-# 再帰的クリーニング
-def unwrap_value(v):
-    if isinstance(v, (list, tuple, np.ndarray)):
-        if len(v) == 0: return 0.0
-        return unwrap_value(v[0])
-    if isinstance(v, str):
-        try:
-            return float(v.replace(',', '').replace('[','').replace(']','').strip())
-        except:
-            return 0.0
     try:
-        return float(v)
-    except:
-        return 0.0
-
-def predict_race(raw_data):
-    recommendations = []
-    
-    clean_data = {}
-    for k, v in raw_data.items():
-        clean_data[k] = unwrap_value(v)
-            
-    try:
-        if not os.path.exists(MODEL_FILE):
-            return []
-
-        models = joblib.load(MODEL_FILE)
-        
-        if 'features' in models:
-            required_feats = models['features']
+        resp = std_requests.post(url, json={"content": content}, timeout=10)
+        if 200 <= resp.status_code < 300:
+            log(f"✅ Discord送信成功: {resp.status_code}")
         else:
-            return []
-
-        df = pd.DataFrame([clean_data])
-        
-        for i in range(1, 7):
-            if f'wr{i}' not in df.columns: df[f'wr{i}'] = 0.0
-            if f'mo{i}' not in df.columns: df[f'mo{i}'] = 0.0
-            if f'ex{i}' not in df.columns: df[f'ex{i}'] = 0.0
-            if f'st{i}' not in df.columns: df[f'st{i}'] = 0.0
-
-        df['wr_mean'] = df[[f'wr{i}' for i in range(1, 7)]].mean(axis=1)
-        df['mo_mean'] = df[[f'mo{i}' for i in range(1, 7)]].mean(axis=1)
-        df['ex_mean'] = df[[f'ex{i}' for i in range(1, 7)]].mean(axis=1)
-        df['st_mean'] = df[[f'st{i}' for i in range(1, 7)]].mean(axis=1)
-
-        for i in range(1, 7):
-            df[f'wr{i}_rel'] = df[f'wr{i}'] - df['wr_mean']
-            df[f'mo{i}_rel'] = df[f'mo{i}'] - df['mo_mean']
-            df[f'ex{i}_rel'] = df['ex_mean'] - df[f'ex{i}'] 
-            df[f'st{i}_rel'] = df['st_mean'] - df[f'st{i}'] 
-        
-        df_final = pd.DataFrame()
-        for f in required_feats:
-            if f in df.columns:
-                df_final[f] = df[f]
-            else:
-                df_final[f] = 0.0
-        
-        X = df_final.values.astype(np.float32)
-        
-        try:
-            def safe_predict_idx(model, input_x):
-                try:
-                    proba = model.predict_proba(input_x)
-                    return np.argmax(proba, axis=1)[0]
-                except:
-                    pass
-                
-                pred = model.predict(input_x)
-                if hasattr(pred, 'ndim') and pred.ndim == 2 and pred.shape[1] > 1:
-                    return np.argmax(pred, axis=1)[0]
-                
-                val = pred[0]
-                if hasattr(val, 'ndim') and val.ndim > 0:
-                    if val.size == 1:
-                        val = val.item()
-                    else:
-                        try: return np.argmax(val)
-                        except: val = val[0]
-                elif isinstance(val, (list, tuple)) and len(val) > 1:
-                     val = val[0]
-                return int(val) - 1
-
-            p1_idx = safe_predict_idx(models['r1'], X)
-            p2_idx = safe_predict_idx(models['r2'], X)
-            p3_idx = safe_predict_idx(models['r3'], X)
-
-        except Exception as inner_e:
-            print(f"⚠️ Internal Predict Error: {inner_e}")
-            return []
-
-        p1, p2, p3 = p1_idx + 1, p2_idx + 1, p3_idx + 1
-        
+            log(f"💀 Discord送信失敗: Code {resp.status_code}")
     except Exception as e:
-        print(f"⚠️ AI Prediction Error: {e}", flush=True)
-        return [] 
+        log(f"💀 Discord接続エラー: {e}")
 
-    form_3t = f"{p1}-{p2}-{p3}"
-    form_2t = f"{p1}-{p2}"
-    
-    strategies = None
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    # ★デバッグ用: 毎回リセットして、修正後の通知をテストする
+    conn.execute("DROP TABLE IF EXISTS history") 
+    conn.execute("CREATE TABLE IF NOT EXISTS history (race_id TEXT PRIMARY KEY, date TEXT, place TEXT, race_no INTEGER, predict_combo TEXT, status TEXT, profit INTEGER)")
+    conn.close()
+    log("🧹 DB初期化完了（履歴リセット済み）")
+
+def report_worker(stop_event):
+    while not stop_event.is_set():
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            conn.row_factory = sqlite3.Row
+            pending = conn.execute("SELECT * FROM history WHERE status='PENDING'").fetchall()
+            sess = get_session()
+            for p in pending:
+                try: jcd = int(p['race_id'].split('_')[1])
+                except: continue
+                
+                from scraper import scrape_result
+                res = scrape_result(sess, jcd, p['race_no'], p['date'])
+                if not res: continue
+
+                hit = False
+                payout = 0
+                combo = p['predict_combo']
+                result_str = "未確定"
+                
+                if str(combo).count("-") == 2:
+                    if res.get('sanrentan_combo'):
+                        result_str = res['sanrentan_combo']
+                        if res['sanrentan_combo'] == combo:
+                            hit = True
+                            payout = res.get('sanrentan_payout', 0) * 10
+                else:
+                    if res.get('nirentan_combo'):
+                        result_str = res['nirentan_combo']
+                        if res['nirentan_combo'] == combo:
+                            hit = True
+                            payout = res.get('nirentan_payout', 0) * 10
+                
+                if result_str != "未確定":
+                    profit = int(payout - 1000)
+                    conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, p['race_id']))
+                    conn.commit()
+                    
+                    if hit:
+                        msg = f"🎯 **{p['place']}{p['race_no']}R** 的中！！\n買い目: **{combo}**\n払戻: {int(payout):,}円\n収支: +{profit:,}円"
+                        log(f"🎯 {p['place']}{p['race_no']}R 的中！ {combo} (+{profit}円)")
+                        send_discord(msg)
+                    else:
+                        log(f"💀 {p['place']}{p['race_no']}R ハズレ... 予想:{combo} 結果:{result_str}")
+            conn.close()
+        except Exception as e:
+            log(f"Report Error: {e}")
+        
+        for _ in range(10):
+            if stop_event.is_set(): break
+            time.sleep(60)
+
+def process_race(jcd, rno, today):
+    sess = get_session()
+    place = PLACE_NAMES[jcd]
     try:
-        if os.path.exists(STRATEGY_FILE):
-            strategies = pd.read_csv(STRATEGY_FILE)
-    except: pass
+        raw, error = scrape_race_data(sess, jcd, rno, today)
+    except Exception as e:
+        return
 
-    # ★ 3連単
-    if p1 != p2 and p1 != p3 and p2 != p3:
-        profit, prob, roi = 0, 0, 0
-        valid = False
-        
-        if strategies is not None:
-            match = strategies[(strategies['券種'] == '3連単') & (strategies['買い目'] == form_3t)]
-            if not match.empty:
-                profit = int(match.iloc[0]['収支'])
-                prob = match.iloc[0]['的中率']
-                roi = match.iloc[0]['回収率']
-                
-                if profit >= MIN_PROFIT and roi >= MIN_ROI:
-                    valid = True
-                    print(f"✅ 採用: 3連単 {form_3t} (期待値:{profit}円)", flush=True)
-                else:
-                    print(f"🛑 却下: 3連単 {form_3t} (期待値:{profit}円)", flush=True)
-        
-        if valid:
-            reason = ask_groq_reason(clean_data, form_3t, "3連単")
-            recommendations.append({
-                'type': '3連単',
-                'combo': form_3t,
-                'prob': prob,
-                'profit': profit,
-                'roi': roi,
-                'reason': reason
-            })
+    if error: return
+    if not raw or raw.get('wr1', 0) == 0: return
 
-    # ★ 2連単
-    if p1 != p2:
-        profit, prob, roi = 0, 0, 0
-        valid = False
+    log(f"✅ {place}{rno}R 取得完了 ------------------------------")
+    log("----------------------------------------------------------")
+
+    try: preds = predict_race(raw)
+    except: return
+    if not preds: return
+
+    conn = sqlite3.connect(DB_FILE)
+    for p in preds:
+        combo = p['combo']
+        race_id = f"{today}_{jcd}_{rno}_{combo}"
+        exists = conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone()
         
-        if strategies is not None:
-            match = strategies[(strategies['券種'] == '2連単') & (strategies['買い目'] == form_2t)]
-            if not match.empty:
-                profit = int(match.iloc[0]['収支'])
-                prob = match.iloc[0]['的中率']
-                roi = match.iloc[0]['回収率']
-                
-                if profit >= MIN_PROFIT and roi >= MIN_ROI:
-                    valid = True
-                    print(f"✅ 採用: 2連単 {form_2t} (期待値:{profit}円)", flush=True)
-                else:
-                    print(f"🛑 却下: 2連単 {form_2t} (期待値:{profit}円)", flush=True)
-        
-        if valid:
-            reason = ask_groq_reason(clean_data, form_2t, "2連単")
-            recommendations.append({
-                'type': '2連単',
-                'combo': form_2t,
-                'prob': prob,
-                'profit': profit,
-                'roi': roi,
-                'reason': reason
-            })
+        if not exists:
+            ptype = p.get('type', '不明')
+            profit = p.get('profit', 0)
+            prob = p.get('prob', 0)
+            roi = p.get('roi', 0)
+            reason = p.get('reason', 'AI解説なし')
             
-    return recommendations
+            log(f"🔥 [HIT] {place}{rno}R -> {combo} (期待値:{profit}円/確率:{prob}%)")
+            odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
+
+            msg = (
+                f"🔥 **{place}{rno}R** AI激熱予想\n"
+                f"🎯 買い目: **{combo}** ({ptype})\n"
+                f"💰 期待値: **+{profit}円**\n"
+                f"📊 自信度: **{prob}%** (回収率:{roi}%)\n"
+                f"📝 **AI解説**: {reason}\n"
+                f"🔗 [オッズ確認・投票]({odds_url})"
+            )
+            
+            conn.execute("INSERT INTO history VALUES (?,?,?,?,?,?,?)", (race_id, today, place, rno, combo, 'PENDING', 0))
+            conn.commit()
+            send_discord(msg)
+            
+    conn.close()
+
+def main():
+    log("🚀 最強AI Bot (DBリセット＆強制通知モード) 起動")
+    init_db()
+    
+    stop_event = threading.Event()
+    t = threading.Thread(target=report_worker, args=(stop_event,), daemon=True)
+    t.start()
+    
+    start_time = time.time()
+    MAX_RUNTIME = 5.8 * 3600
+
+    while True:
+        now = datetime.datetime.now(JST)
+        if now.hour == 23 and now.minute >= 55:
+            break
+        if time.time() - start_time > MAX_RUNTIME:
+            break
+
+        today = now.strftime('%Y%m%d')
+        log(f"⚡ Scan Start: {now.strftime('%H:%M:%S')}")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            for jcd in range(1, 25):
+                for rno in range(1, 13):
+                    ex.submit(process_race, jcd, rno, today)
+        
+        log("💤 休憩中...")
+        time.sleep(300)
+
+    stop_event.set()
+    log("👋 Bot停止")
+
+if __name__ == "__main__":
+    main()
