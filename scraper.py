@@ -72,7 +72,9 @@ def scrape_race_data(session, jcd, rno, date_str):
         try:
             cell = soup_before.select_one(f".is-boatColor{i}")
             if cell:
-                tds = cell.find_parent("tbody").select("td")
+                # ★修正箇所1: tbody -> tr に変更
+                # これで行全体ではなく、その艇の行だけを取得します
+                tds = cell.find_parent("tr").select("td")
                 if len(tds) > 4:
                     val = clean_text(tds[4].text)
                     if re.match(r"\d\.\d{2}", val): row[f'ex{i}'] = float(val)
@@ -82,7 +84,8 @@ def scrape_race_data(session, jcd, rno, date_str):
         try:
             cell = soup_list.select_one(f".is-boatColor{i}")
             if cell:
-                tds = cell.find_parent("tbody").select("td")
+                # ★修正箇所2: tbody -> tr に変更
+                tds = cell.find_parent("tr").select("td")
                 
                 # F数 / ST
                 if len(tds) > 3:
