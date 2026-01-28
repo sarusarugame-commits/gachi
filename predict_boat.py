@@ -5,30 +5,35 @@ import joblib
 import os
 import re
 import traceback
-from groq import Groq
+from openai import OpenAI # ★変更: OpenAIライブラリを使用
 
 MODEL_FILE = 'ultimate_boat_model.pkl'
 STRATEGY_FILE = 'ultimate_winning_strategies.csv'
 
 # ==========================================
-# ⚙️ 本番運用設定 (足切りライン)
+# ⚙️ 本番運用設定
 # ==========================================
 MIN_PROFIT = 1000   # 期待値1000円以上のみ通知
 MIN_ROI = 110       # 回収率110%以上のみ通知
 
-# Groq設定
-GROQ_URL = "https://api.groq.com/openai/v1"
+# Groq設定 (OpenAI互換エンドポイント)
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 client = None
 if os.environ.get("GROQ_API_KEY"):
-    client = Groq(
+    client = OpenAI(
         api_key=os.environ.get("GROQ_API_KEY"),
-        base_url=GROQ_URL
+        base_url=GROQ_BASE_URL # ★重要: ここでGroqに向ける
     )
 
 def ask_groq_reason(row, combo, ptype):
-    if not client: return "AI解説: (APIキー設定確認中)"
+    print(f"🤖 Groq API呼び出し(OpenAI Client): {combo} ({ptype})...", flush=True)
+    
+    if not client: 
+        print("❌ Groq Error: APIキーが設定されていません", flush=True)
+        return "AI解説: (APIキー設定なし)"
+    
     try:
         def safe_get(key):
             try:
@@ -47,6 +52,7 @@ def ask_groq_reason(row, combo, ptype):
         )
         prompt = f"買い目「{combo}」({ptype})を推奨する理由を、競艇のプロとして100文字以内で断言せよ。\nデータ:\n{data_str}"
         
+        # OpenAIライブラリの書き方はGroqと同じ
         completion = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
@@ -56,8 +62,12 @@ def ask_groq_reason(row, combo, ptype):
             temperature=0.7,
             max_tokens=150,
         )
-        return completion.choices[0].message.content
+        content = completion.choices[0].message.content
+        print(f"🤖 Groq応答成功: {content[:20]}...", flush=True)
+        return content
+
     except Exception as e:
+        print(f"❌ Groq API Error: {e}", flush=True)
         return f"AI解説エラー: {str(e)}"
 
 # 再帰的クリーニング
@@ -79,7 +89,7 @@ def predict_race(raw_data):
     recommendations = []
     
     # ---------------------------------------------------------
-    # 0. 前処理: 辞書 -> フラットな辞書 (全float)
+    # 0. 前処理
     # ---------------------------------------------------------
     clean_data = {}
     for k, v in raw_data.items():
@@ -97,13 +107,10 @@ def predict_race(raw_data):
         if 'features' in models:
             required_feats = models['features']
         else:
-            print("⚠️ Model Error: 'features' key missing.")
             return []
 
-        # DataFrame作成
         df = pd.DataFrame([clean_data])
         
-        # 特徴量エンジニアリング
         for i in range(1, 7):
             if f'wr{i}' not in df.columns: df[f'wr{i}'] = 0.0
             if f'mo{i}' not in df.columns: df[f'mo{i}'] = 0.0
@@ -121,7 +128,6 @@ def predict_race(raw_data):
             df[f'ex{i}_rel'] = df['ex_mean'] - df[f'ex{i}'] 
             df[f'st{i}_rel'] = df['st_mean'] - df[f'st{i}'] 
         
-        # モデル入力整形
         df_final = pd.DataFrame()
         for f in required_feats:
             if f in df.columns:
@@ -129,11 +135,9 @@ def predict_race(raw_data):
             else:
                 df_final[f] = 0.0
         
-        # NumPy配列(float32)に変換して予測
         X = df_final.values.astype(np.float32)
         
         try:
-            # 内部ヘルパー関数
             def safe_predict_idx(model, input_x):
                 try:
                     proba = model.predict_proba(input_x)
@@ -174,36 +178,37 @@ def predict_race(raw_data):
         return [] 
 
     # ---------------------------------------------------------
-    # 2. 買い目作成とフィルタリング (本番ロジック)
+    # 2. 買い目作成とフィルタリング
     # ---------------------------------------------------------
     form_3t = f"{p1}-{p2}-{p3}"
     form_2t = f"{p1}-{p2}"
     
-    # 戦略ファイルを読み込み
     strategies = None
     try:
         if os.path.exists(STRATEGY_FILE):
             strategies = pd.read_csv(STRATEGY_FILE)
-    except:
-        pass
+    except: pass
 
-    # ★ 3連単フィルタリング
+    # ★ 3連単チェック
     if p1 != p2 and p1 != p3 and p2 != p3:
         profit, prob, roi = 0, 0, 0
         valid = False
         
-        # CSVから実績データを取得
         if strategies is not None:
             match = strategies[(strategies['券種'] == '3連単') & (strategies['買い目'] == form_3t)]
             if not match.empty:
                 profit = int(match.iloc[0]['収支'])
                 prob = match.iloc[0]['的中率']
                 roi = match.iloc[0]['回収率']
-                # 条件チェック
+                
                 if profit >= MIN_PROFIT and roi >= MIN_ROI:
                     valid = True
+                    print(f"✅ 採用: 3連単 {form_3t} (期待値:{profit}円/ROI:{roi}%)", flush=True)
+                else:
+                    print(f"🛑 却下: 3連単 {form_3t} (期待値:{profit}円/ROI:{roi}%) - 基準不足", flush=True)
+            else:
+                print(f"⚠️ データなし: 3連単 {form_3t}", flush=True)
         
-        # 条件を満たす場合のみ通知リストへ
         if valid:
             reason = ask_groq_reason(clean_data, form_3t, "3連単")
             recommendations.append({
@@ -215,7 +220,7 @@ def predict_race(raw_data):
                 'reason': reason
             })
 
-    # ★ 2連単フィルタリング
+    # ★ 2連単チェック
     if p1 != p2:
         profit, prob, roi = 0, 0, 0
         valid = False
@@ -226,8 +231,14 @@ def predict_race(raw_data):
                 profit = int(match.iloc[0]['収支'])
                 prob = match.iloc[0]['的中率']
                 roi = match.iloc[0]['回収率']
+                
                 if profit >= MIN_PROFIT and roi >= MIN_ROI:
                     valid = True
+                    print(f"✅ 採用: 2連単 {form_2t} (期待値:{profit}円/ROI:{roi}%)", flush=True)
+                else:
+                    print(f"🛑 却下: 2連単 {form_2t} (期待値:{profit}円/ROI:{roi}%) - 基準不足", flush=True)
+            else:
+                print(f"⚠️ データなし: 2連単 {form_2t}", flush=True)
         
         if valid:
             reason = ask_groq_reason(clean_data, form_2t, "2連単")
