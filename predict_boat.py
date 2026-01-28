@@ -3,7 +3,7 @@ import numpy as np
 import lightgbm as lgb
 import joblib
 import os
-import requests # ★公式ライブラリ廃止、requestsを使用
+import requests
 import time
 import json
 import traceback
@@ -19,11 +19,12 @@ MIN_ROI = 110
 
 # Groq設定
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-# ★モデル名は元のまま
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 def ask_groq_reason(row, combo, ptype):
-    api_key = os.environ.get("GROQ_API_KEY")
+    # ★修正: APIキーの前後の空白・改行を削除してクリーンにする
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    
     print(f"🤖 Groq API呼び出し(requests): {combo}...", flush=True)
     
     if not api_key: 
@@ -65,7 +66,6 @@ def ask_groq_reason(row, combo, ptype):
     # リトライ処理
     for attempt in range(3):
         try:
-            # ★requestsで直接POST送信 (ライブラリ依存なし)
             response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=10)
             
             if response.status_code == 200:
