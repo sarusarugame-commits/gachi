@@ -9,7 +9,6 @@ MODEL_FILE = 'ultimate_boat_model.pkl'
 STRATEGY_FILE = 'ultimate_winning_strategies.csv'
 
 # ★強制通知設定（動作確認用）
-# 動作確認できたら、ここを元の数値（1000など）に戻してください
 MIN_PROFIT = -999999 
 MIN_ROI = 0       
 
@@ -27,11 +26,18 @@ if os.environ.get("GROQ_API_KEY"):
 def ask_groq_reason(row, combo, ptype):
     if not client: return "AI解説: (APIキー設定確認中)"
     try:
+        # 値を取り出す際にも安全策を講じる
+        def get_val(key):
+            v = row.get(key, 0)
+            if isinstance(v, list) or isinstance(v, np.ndarray):
+                return v[0] if len(v) > 0 else 0
+            return v
+            
         data_str = (
-            f"1号艇:勝率{row.get('wr1',0)}\n"
-            f"2号艇:勝率{row.get('wr2',0)}\n"
-            f"3号艇:勝率{row.get('wr3',0)}\n"
-            f"4号艇:勝率{row.get('wr4',0)}\n"
+            f"1号艇:勝率{get_val('wr1')}\n"
+            f"2号艇:勝率{get_val('wr2')}\n"
+            f"3号艇:勝率{get_val('wr3')}\n"
+            f"4号艇:勝率{get_val('wr4')}\n"
         )
         prompt = f"買い目「{combo}」({ptype})を推奨する理由を、競艇のプロとして100文字以内で断言せよ。\nデータ:\n{data_str}"
         
@@ -56,7 +62,12 @@ def engineer_features(df):
         'wr3', 'mo3', 'ex3', 'st3', 'wr4', 'mo4', 'ex4', 'st4',
         'wr5', 'mo5', 'ex5', 'st5', 'wr6', 'mo6', 'ex6', 'st6'
     ]
+    
+    # ★修正ポイント: リストや配列の中身を強制的に取り出す
     for col in base_cols:
+        # まずリストかどうかチェックして、リストなら先頭要素を取り出す関数を適用
+        df[col] = df[col].apply(lambda x: x[0] if isinstance(x, (list, np.ndarray)) and len(x) > 0 else x)
+        # その後、数値変換
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
 
     # 追加特徴量
@@ -77,7 +88,7 @@ def predict_race(raw_data):
     recommendations = []
     
     # ---------------------------------------------------------
-    # 1. AI予測 (Feature Alignment & LightGBM Only)
+    # 1. AI予測
     # ---------------------------------------------------------
     try:
         if not os.path.exists(MODEL_FILE):
@@ -85,7 +96,6 @@ def predict_race(raw_data):
 
         models = joblib.load(MODEL_FILE)
         
-        # モデル内の特徴量リストを取得
         if 'features' in models:
             required_feats = models['features']
         else:
@@ -94,15 +104,15 @@ def predict_race(raw_data):
 
         # データ作成
         df = pd.DataFrame([raw_data])
-        df = engineer_features(df)
+        df = engineer_features(df) # ここで型変換される
         
-        # ★重要: 列をモデル定義順に強制ソート＆不足列埋め
+        # 列の整合性確保
         df_final = pd.DataFrame()
         for f in required_feats:
             if f in df.columns:
                 df_final[f] = df[f]
             else:
-                df_final[f] = 0.0 # 不足列は0埋め
+                df_final[f] = 0.0
         
         # 予測実行
         try:
@@ -116,20 +126,17 @@ def predict_race(raw_data):
 
         p1, p2, p3 = p1_idx + 1, p2_idx + 1, p3_idx + 1
         
-        # ここまで来ればAI予測成功
-        
     except Exception as e:
-        # AI失敗時は何も返さない（ログだけ出す）
         print(f"⚠️ AI Prediction Error: {e}", flush=True)
-        return []
+        return [] # エラー時は通知しない
 
     # ---------------------------------------------------------
-    # 2. 買い目作成 (AIが成功した場合のみここに来る)
+    # 2. 買い目作成 (AI成功時のみ)
     # ---------------------------------------------------------
     form_3t = f"{p1}-{p2}-{p3}"
     form_2t = f"{p1}-{p2}"
     
-    profit, prob, roi = 9999, 99.9, 999 # CSVがない場合の仮値
+    profit, prob, roi = 9999, 99.9, 999 
     
     try:
         if os.path.exists(STRATEGY_FILE):
