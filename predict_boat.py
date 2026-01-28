@@ -4,6 +4,7 @@ import lightgbm as lgb
 import joblib
 import os
 import re
+import time
 import traceback
 from groq import Groq
 
@@ -17,13 +18,13 @@ MIN_PROFIT = 1000
 MIN_ROI = 110       
 
 # Groq設定
-# ★モデルを元の「meta-llama/llama-4-scout-17b-16e-instruct」に戻しました
+# ★指定されたモデルに固定
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 client = None
 if os.environ.get("GROQ_API_KEY"):
     try:
-        # ★ base_url は削除（これが通信エラーの原因でした）
+        # ★ base_url は削除（接続エラーの真因）
         client = Groq(
             api_key=os.environ.get("GROQ_API_KEY")
         )
@@ -37,40 +38,43 @@ def ask_groq_reason(row, combo, ptype):
         print("❌ Groq Error: クライアントが初期化されていません", flush=True)
         return "AI解説: (接続エラー)"
     
-    try:
-        def safe_get(key):
-            try:
-                val = row.get(key, 0)
-                if isinstance(val, (list, np.ndarray)):
-                    return val[0] if len(val) > 0 else 0
-                return val
-            except:
-                return 0
-            
-        data_str = (
-            f"1号艇:勝率{safe_get('wr1')}\n"
-            f"2号艇:勝率{safe_get('wr2')}\n"
-            f"3号艇:勝率{safe_get('wr3')}\n"
-            f"4号艇:勝率{safe_get('wr4')}\n"
-        )
-        prompt = f"買い目「{combo}」({ptype})を推奨する理由を、競艇のプロとして100文字以内で断言せよ。\nデータ:\n{data_str}"
+    def safe_get(key):
+        try:
+            val = row.get(key, 0)
+            if isinstance(val, (list, np.ndarray)):
+                return val[0] if len(val) > 0 else 0
+            return val
+        except:
+            return 0
         
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a professional boat race analyst. Answer in Japanese."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=150,
-        )
-        content = completion.choices[0].message.content
-        print(f"🤖 Groq応答成功", flush=True)
-        return content
+    data_str = (
+        f"1号艇:勝率{safe_get('wr1')}\n"
+        f"2号艇:勝率{safe_get('wr2')}\n"
+        f"3号艇:勝率{safe_get('wr3')}\n"
+        f"4号艇:勝率{safe_get('wr4')}\n"
+    )
+    prompt = f"買い目「{combo}」({ptype})を推奨する理由を、競艇のプロとして100文字以内で断言せよ。\nデータ:\n{data_str}"
+    
+    # リトライ処理 (接続エラー対策)
+    for attempt in range(3):
+        try:
+            completion = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a professional boat race analyst. Answer in Japanese."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=150,
+            )
+            content = completion.choices[0].message.content
+            print(f"🤖 Groq応答成功", flush=True)
+            return content
+        except Exception as e:
+            print(f"⚠️ Groq API Error (Attempt {attempt+1}): {e}", flush=True)
+            time.sleep(2)
 
-    except Exception as e:
-        print(f"❌ Groq API Error: {e}", flush=True)
-        return f"AI解説エラー: {str(e)}"
+    return "AI解説: (通信エラー)"
 
 # 再帰的クリーニング
 def unwrap_value(v):
