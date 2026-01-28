@@ -26,11 +26,20 @@ if os.environ.get("GROQ_API_KEY"):
 def ask_groq_reason(row, combo, ptype):
     if not client: return "AI解説: (APIキー設定確認中)"
     try:
+        def safe_get(key):
+            try:
+                val = row.get(key, 0)
+                if isinstance(val, (list, np.ndarray)):
+                    return val[0] if len(val) > 0 else 0
+                return val
+            except:
+                return 0
+            
         data_str = (
-            f"1号艇:勝率{row.get('wr1',0)}\n"
-            f"2号艇:勝率{row.get('wr2',0)}\n"
-            f"3号艇:勝率{row.get('wr3',0)}\n"
-            f"4号艇:勝率{row.get('wr4',0)}\n"
+            f"1号艇:勝率{safe_get('wr1')}\n"
+            f"2号艇:勝率{safe_get('wr2')}\n"
+            f"3号艇:勝率{safe_get('wr3')}\n"
+            f"4号艇:勝率{safe_get('wr4')}\n"
         )
         prompt = f"買い目「{combo}」({ptype})を推奨する理由を、競艇のプロとして100文字以内で断言せよ。\nデータ:\n{data_str}"
         
@@ -47,33 +56,30 @@ def ask_groq_reason(row, combo, ptype):
     except Exception as e:
         return f"AI解説エラー: {str(e)}"
 
-# ★最強のクリーニング関数（辞書の値そのものを直す）
+# 再帰的クリーニング
 def unwrap_value(v):
-    # リストや配列なら中身を取り出す（再帰）
     if isinstance(v, (list, tuple, np.ndarray)):
         if len(v) == 0: return 0.0
         return unwrap_value(v[0])
-    # 文字列なら数値化
     if isinstance(v, str):
         try:
             return float(v.replace(',', '').replace('[','').replace(']','').strip())
         except:
             return 0.0
-    return v
+    try:
+        return float(v)
+    except:
+        return 0.0
 
 def predict_race(raw_data):
     recommendations = []
     
     # ---------------------------------------------------------
-    # 0. 前処理: 辞書の中身をここで全部フラットな数値にする
+    # 0. 前処理: 辞書 -> フラットな辞書 (全float)
     # ---------------------------------------------------------
     clean_data = {}
     for k, v in raw_data.items():
-        try:
-            val = unwrap_value(v)
-            clean_data[k] = float(val) # 強制的にfloat
-        except:
-            clean_data[k] = 0.0
+        clean_data[k] = unwrap_value(v)
             
     # ---------------------------------------------------------
     # 1. AI予測
@@ -90,10 +96,17 @@ def predict_race(raw_data):
             print("⚠️ Model Error: 'features' key missing.")
             return []
 
-        # クリーンなデータからDataFrame作成
+        # DataFrame作成
         df = pd.DataFrame([clean_data])
         
-        # 特徴量エンジニアリング（単純計算のみ）
+        # 特徴量エンジニアリング
+        # カラムが存在しない場合は0埋めしてから計算
+        for i in range(1, 7):
+            if f'wr{i}' not in df.columns: df[f'wr{i}'] = 0.0
+            if f'mo{i}' not in df.columns: df[f'mo{i}'] = 0.0
+            if f'ex{i}' not in df.columns: df[f'ex{i}'] = 0.0
+            if f'st{i}' not in df.columns: df[f'st{i}'] = 0.0
+
         df['wr_mean'] = df[[f'wr{i}' for i in range(1, 7)]].mean(axis=1)
         df['mo_mean'] = df[[f'mo{i}' for i in range(1, 7)]].mean(axis=1)
         df['ex_mean'] = df[[f'ex{i}' for i in range(1, 7)]].mean(axis=1)
@@ -105,7 +118,7 @@ def predict_race(raw_data):
             df[f'ex{i}_rel'] = df['ex_mean'] - df[f'ex{i}'] 
             df[f'st{i}_rel'] = df['st_mean'] - df[f'st{i}'] 
         
-        # 列の整合性確保
+        # モデルが要求する列だけに絞る（並び順も強制）
         df_final = pd.DataFrame()
         for f in required_feats:
             if f in df.columns:
@@ -113,24 +126,32 @@ def predict_race(raw_data):
             else:
                 df_final[f] = 0.0
         
+        # ★★★ ここが修正の肝 ★★★
+        # DataFrameをそのまま渡さず、NumPy配列(float32)に変換してから渡す
+        # これで "array cannot be converted to scalar" エラーを回避
+        X = df_final.values.astype(np.float32)
+        
         # 予測実行
         try:
-            p1_idx = np.argmax(models['r1'].predict_proba(df_final), axis=1)[0]
-            p2_idx = np.argmax(models['r2'].predict_proba(df_final), axis=1)[0]
-            p3_idx = np.argmax(models['r3'].predict_proba(df_final), axis=1)[0]
+            p1_idx = np.argmax(models['r1'].predict_proba(X), axis=1)[0]
+            p2_idx = np.argmax(models['r2'].predict_proba(X), axis=1)[0]
+            p3_idx = np.argmax(models['r3'].predict_proba(X), axis=1)[0]
         except:
-            p1_idx = int(models['r1'].predict(df_final)[0]) - 1
-            p2_idx = int(models['r2'].predict(df_final)[0]) - 1
-            p3_idx = int(models['r3'].predict(df_final)[0]) - 1
+            p1_idx = int(models['r1'].predict(X)[0]) - 1
+            p2_idx = int(models['r2'].predict(X)[0]) - 1
+            p3_idx = int(models['r3'].predict(X)[0]) - 1
 
         p1, p2, p3 = p1_idx + 1, p2_idx + 1, p3_idx + 1
         
     except Exception as e:
+        # 詳細なエラー情報を出す
+        import traceback
         print(f"⚠️ AI Prediction Error: {e}", flush=True)
+        # traceback.print_exc() # 必要ならコメントアウト解除
         return [] 
 
     # ---------------------------------------------------------
-    # 2. 買い目作成 (AI成功時のみ)
+    # 2. 買い目作成
     # ---------------------------------------------------------
     form_3t = f"{p1}-{p2}-{p3}"
     form_2t = f"{p1}-{p2}"
