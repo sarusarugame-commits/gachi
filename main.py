@@ -37,11 +37,10 @@ def send_discord(content):
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    # ★デバッグ用: 毎回リセットして、修正後の通知をテストする
-    conn.execute("DROP TABLE IF EXISTS history") 
+    # ★本番仕様: DROP TABLEを削除し、データを永続化させる
     conn.execute("CREATE TABLE IF NOT EXISTS history (race_id TEXT PRIMARY KEY, date TEXT, place TEXT, race_no INTEGER, predict_combo TEXT, status TEXT, profit INTEGER)")
     conn.close()
-    log("🧹 DB初期化完了（履歴リセット済み）")
+    log("💾 DB接続完了（履歴保持モード）")
 
 def report_worker(stop_event):
     while not stop_event.is_set():
@@ -117,6 +116,8 @@ def process_race(jcd, rno, today):
     for p in preds:
         combo = p['combo']
         race_id = f"{today}_{jcd}_{rno}_{combo}"
+        
+        # 重複チェック（既に通知済みならスキップ）
         exists = conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone()
         
         if not exists:
@@ -145,7 +146,7 @@ def process_race(jcd, rno, today):
     conn.close()
 
 def main():
-    log("🚀 最強AI Bot (DBリセット＆強制通知モード) 起動")
+    log("🚀 最強AI Bot (本番運用モード) 起動")
     init_db()
     
     stop_event = threading.Event()
@@ -157,9 +158,13 @@ def main():
 
     while True:
         now = datetime.datetime.now(JST)
+        # ミッドナイト終了時刻
         if now.hour == 23 and now.minute >= 55:
+            log(f"🌙 {now.strftime('%H:%M')} ミッドナイト終了。")
             break
+        # GitHub Actionsのタイムアウト対策
         if time.time() - start_time > MAX_RUNTIME:
+            log("🔄 稼働時間上限。")
             break
 
         today = now.strftime('%Y%m%d')
