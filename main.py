@@ -22,32 +22,11 @@ sys.stdout.reconfigure(encoding='utf-8')
 def log(msg):
     print(msg, flush=True)
 
-# ★修正ポイント：エラーを握りつぶさず、詳細を表示する
 def send_discord(content):
     url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not url:
-        log("❌ Discord Error: 環境変数 DISCORD_WEBHOOK_URL が設定されていません！")
-        return
-
-    # URLの形式チェック（誤ってスペースが入っていないかなど）
-    if not url.startswith("http"):
-        log(f"❌ Discord Error: URLの形式がおかしいです -> {url[:10]}...")
-        return
-
-    try:
-        # 実際に送信
-        resp = std_requests.post(url, json={"content": content}, timeout=10)
-        
-        # ステータスコードチェック
-        if 200 <= resp.status_code < 300:
-            log(f"✅ Discord送信成功: {resp.status_code}")
-        else:
-            # 400 Bad Request, 401 Unauthorized, 404 Not Found など
-            log(f"💀 Discord送信失敗: Code {resp.status_code}")
-            log(f"   Response: {resp.text}") # エラー内容（「Invalid Webhook Token」など）を表示
-            
-    except Exception as e:
-        log(f"💀 Discord接続エラー: {e}")
+    if url: 
+        try: std_requests.post(url, json={"content": content}, timeout=10)
+        except: pass
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -80,7 +59,7 @@ def report_worker(stop_event):
                         result_str = res['sanrentan_combo']
                         if res['sanrentan_combo'] == combo:
                             hit = True
-                            payout = res.get('sanrentan_payout', 0) * 10
+                            payout = res.get('sanrentan_payout', 0) * 10 # 100円単位*10=1000円
                 else:
                     if res.get('nirentan_combo'):
                         result_str = res['nirentan_combo']
@@ -94,9 +73,8 @@ def report_worker(stop_event):
                     conn.commit()
                     
                     if hit:
-                        msg = f"🎯 **{p['place']}{p['race_no']}R** 的中！！\n買い目: **{combo}**\n払戻: {int(payout):,}円\n収支: +{profit:,}円"
+                        send_discord(f"🎯 **{p['place']}{p['race_no']}R** 的中！！\n買い目: **{combo}**\n払戻: {int(payout):,}円\n収支: +{profit:,}円")
                         log(f"🎯 {p['place']}{p['race_no']}R 的中！ {combo} (+{profit}円)")
-                        send_discord(msg)
                     else:
                         log(f"💀 {p['place']}{p['race_no']}R ハズレ... 予想:{combo} 結果:{result_str}")
             conn.close()
@@ -119,7 +97,7 @@ def process_race(jcd, rno, today):
     if error: return
     if not raw or raw.get('wr1', 0) == 0: return
 
-    # ログ出力（データ確認用）
+    # ★復活：全データをCSV形式でログに出す（ここが消えていました）★
     log(f"✅ {place}{rno}R 取得完了 ------------------------------")
     headers = [
         'date', 'jcd', 'rno', 'wind', 'res1', 'rank1', 'rank2', 'rank3',
@@ -131,8 +109,9 @@ def process_race(jcd, rno, today):
         'wr5', 'mo5', 'ex5', 'f5', 'st5',
         'wr6', 'mo6', 'ex6', 'f6', 'st6'
     ]
+    # 値を文字列化してカンマ結合
     values = [str(raw.get(k, '')) for k in headers]
-    # log(f"   DATA: {','.join(values)}") # データログが多すぎる場合はコメントアウト推奨
+    log(f"   DATA: {','.join(values)}")
     log("----------------------------------------------------------")
 
     try: preds = predict_race(raw)
@@ -166,36 +145,29 @@ def process_race(jcd, rno, today):
             
             conn.execute("INSERT INTO history VALUES (?,?,?,?,?,?,?)", (race_id, today, place, rno, combo, 'PENDING', 0))
             conn.commit()
-            
-            # ここで送信処理を呼び出す
             send_discord(msg)
-            
     conn.close()
 
 def main():
-    log("🚀 最強AI Bot (デバッグモード: 通知エラー全表示) 起動")
-    
-    # 起動時に一度だけテスト送信を行う（これでURLが死んでるか即わかる）
-    log("🧪 起動時 Discord接続テスト...")
-    send_discord("🚀 Botが起動しました。このメッセージが見えていますか？")
-
+    log("🚀 最強AI Bot (全データログ＆ミッドナイト完全統合版) 起動")
     init_db()
     stop_event = threading.Event()
     t = threading.Thread(target=report_worker, args=(stop_event,), daemon=True)
     t.start()
     
     start_time = time.time()
-    MAX_RUNTIME = 5.8 * 3600
+    MAX_RUNTIME = 5.8 * 3600 # エラー回避のため5.8時間で再起動
 
     while True:
         now = datetime.datetime.now(JST)
         
+        # 23:55終了設定（ミッドナイト対応）
         if now.hour == 23 and now.minute >= 55:
-            log(f"🌙 {now.strftime('%H:%M')} ミッドナイト終了。")
+            log(f"🌙 {now.strftime('%H:%M')} ミッドナイト終了。本日の営業を終了します。")
             break
         
         if time.time() - start_time > MAX_RUNTIME:
-            log("🔄 稼働時間上限。")
+            log("🔄 稼働時間上限。次のスケジュールへバトンタッチします。")
             break
 
         today = now.strftime('%Y%m%d')
