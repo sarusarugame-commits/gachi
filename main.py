@@ -6,9 +6,9 @@ import concurrent.futures
 import threading
 import sys
 import requests as std_requests
-import pandas as pd
+import json
 
-# 自作モジュール (scrape_race_data だけで全て取ってくるように変更しました)
+# 自作モジュール
 from scraper import scrape_race_data, get_session
 from predict_boat import predict_race
 
@@ -27,58 +27,136 @@ def send_discord(content):
         try: std_requests.post(url, json={"content": content}, timeout=10)
         except: pass
 
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("CREATE TABLE IF NOT EXISTS history (race_id TEXT PRIMARY KEY, date TEXT, place TEXT, race_no INTEGER, predict_combo TEXT, status TEXT, profit INTEGER)")
+    conn.close()
+
+def report_worker(stop_event):
+    while not stop_event.is_set():
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            conn.row_factory = sqlite3.Row
+            pending = conn.execute("SELECT * FROM history WHERE status='PENDING'").fetchall()
+            sess = get_session()
+            for p in pending:
+                try: jcd = int(p['race_id'].split('_')[1])
+                except: continue
+                
+                from scraper import scrape_result
+                res = scrape_result(sess, jcd, p['race_no'], p['date'])
+                if not res: continue
+
+                hit = False
+                payout = 0
+                combo = p['predict_combo']
+                result_str = "未確定"
+                
+                if str(combo).count("-") == 2:
+                    if res.get('sanrentan_combo'):
+                        result_str = res['sanrentan_combo']
+                        if res['sanrentan_combo'] == combo:
+                            hit = True
+                            payout = res.get('sanrentan_payout', 0) * 10
+                else:
+                    if res.get('nirentan_combo'):
+                        result_str = res['nirentan_combo']
+                        if res['nirentan_combo'] == combo:
+                            hit = True
+                            payout = res.get('nirentan_payout', 0) * 10
+                
+                if result_str != "未確定":
+                    profit = int(payout - 1000)
+                    conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, p['race_id']))
+                    conn.commit()
+                    
+                    if hit:
+                        send_discord(f"🎯 **{p['place']}{p['race_no']}R** 的中！！\n買い目: **{combo}**\n払戻: {int(payout):,}円\n収支: +{profit:,}円")
+                        log(f"🎯 {p['place']}{p['race_no']}R 的中！ {combo} (+{profit}円)")
+                    else:
+                        log(f"💀 {p['place']}{p['race_no']}R ハズレ... 予想:{combo} 結果:{result_str}")
+            conn.close()
+        except Exception as e:
+            log(f"Report Error: {e}")
+        
+        for _ in range(10):
+            if stop_event.is_set(): break
+            time.sleep(60)
+
 def process_race(jcd, rno, today):
     sess = get_session()
     place = PLACE_NAMES[jcd]
-    
-    # 全42項目を取得
     try:
         raw, error = scrape_race_data(sess, jcd, rno, today)
     except Exception as e:
         log(f"❌ {place}{rno}R: エラー {e}")
         return
 
-    if error:
-        return # NO_DATA等は無視
+    if error: return
+    if not raw or raw.get('wr1', 0) == 0: return
 
-    # 取得データの証明ログ (ご指定の並び順で表示)
-    log(f"✅ {place}{rno}R 取得完了 ------------------------------")
-    
-    # ヘッダー順に値を整形して表示
-    headers = [
-        'date', 'jcd', 'rno', 'wind', 'res1', 'rank1', 'rank2', 'rank3',
-        'tansho', 'nirentan', 'sanrentan', 'sanrenpuku', 'payout',
-        'wr1', 'mo1', 'ex1', 'f1', 'st1',
-        'wr2', 'mo2', 'ex2', 'f2', 'st2',
-        'wr3', 'mo3', 'ex3', 'f3', 'st3',
-        'wr4', 'mo4', 'ex4', 'f4', 'st4',
-        'wr5', 'mo5', 'ex5', 'f5', 'st5',
-        'wr6', 'mo6', 'ex6', 'f6', 'st6'
-    ]
-    
-    # 簡易表示用のCSV行を作成
-    values = [str(raw.get(k, '')) for k in headers]
-    log(f"   DATA: {','.join(values)}")
-    log("----------------------------------------------------------")
+    log(f"✅ {place}{rno}R 取得完了 [風:{raw['wind']}m] 1号艇(勝率:{raw['wr1']})")
 
-    # 予測実行 (予測ロジックに必要なキーは全て raw に含まれています)
-    try:
-        preds = predict_race(raw)
+    try: preds = predict_race(raw)
     except: return
-
     if not preds: return
 
-    # Discord通知など
+    conn = sqlite3.connect(DB_FILE)
     for p in preds:
-        log(f"🔥 [HIT] {place}{rno}R -> {p['combo']} (期待値:{p['profit']}円)")
-        send_discord(f"🔥 **{place}{rno}R** 推奨 {p['combo']}")
+        combo = p['combo']
+        race_id = f"{today}_{jcd}_{rno}_{combo}"
+        exists = conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone()
+        
+        if not exists:
+            ptype = p.get('type', '不明')
+            profit = p.get('profit', 0)
+            prob = p.get('prob', 0)
+            roi = p.get('roi', 0)
+            reason = p.get('reason', 'AI解説なし')
+            
+            log(f"🔥 [HIT] {place}{rno}R -> {combo} (期待値:{profit}円/確率:{prob}%)")
+            odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
+
+            msg = (
+                f"🔥 **{place}{rno}R** AI激熱予想\n"
+                f"🎯 買い目: **{combo}** ({ptype})\n"
+                f"💰 期待値: **+{profit}円**\n"
+                f"📊 自信度: **{prob}%** (回収率:{roi}%)\n"
+                f"📝 **AI解説**: {reason}\n"
+                f"🔗 [オッズ確認・投票]({odds_url})"
+            )
+            
+            conn.execute("INSERT INTO history VALUES (?,?,?,?,?,?,?)", (race_id, today, place, rno, combo, 'PENDING', 0))
+            conn.commit()
+            send_discord(msg)
+    conn.close()
 
 def main():
-    log("🚀 最強AI Bot (全項目完全取得版) 起動")
+    log("🚀 最強AI Bot (ミッドナイト対応版) 起動")
+    init_db()
+    stop_event = threading.Event()
+    t = threading.Thread(target=report_worker, args=(stop_event,), daemon=True)
+    t.start()
     
+    start_time = time.time()
+    MAX_RUNTIME = 5.8 * 3600 # 5.8時間 (エラー回避のため6時間ギリギリ手前で停止)
+
     while True:
-        today = datetime.datetime.now(JST).strftime('%Y%m%d')
-        log(f"⚡ Scan Start: {datetime.datetime.now(JST).strftime('%H:%M:%S')}")
+        now = datetime.datetime.now(JST)
+        
+        # ★修正: 23:55までは稼働する（ミッドナイト最終Rの結果反映のため）
+        if now.hour == 23 and now.minute >= 55:
+            log(f"🌙 {now.strftime('%H:%M')} ミッドナイト開催も終了しました。本日の営業を終了します。")
+            break
+        
+        # 稼働時間制限チェック
+        elapsed = time.time() - start_time
+        if elapsed > MAX_RUNTIME:
+            log("🔄 稼働時間上限に達しました。次のスケジュールへバトンタッチします。")
+            break
+
+        today = now.strftime('%Y%m%d')
+        log(f"⚡ Scan Start: {now.strftime('%H:%M:%S')}")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
             for jcd in range(1, 25):
@@ -87,6 +165,9 @@ def main():
         
         log("💤 休憩中...")
         time.sleep(300)
+
+    stop_event.set()
+    log("👋 Bot停止")
 
 if __name__ == "__main__":
     main()
