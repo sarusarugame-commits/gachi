@@ -1,29 +1,16 @@
-name: Boat Race Bot
+name: Debug Boat Model
 
 on:
-  schedule:
-    # 1. 朝の部: 08:30 JST (23:30 UTC)
-    #    -> 14:15頃まで稼働
-    - cron: '30 23 * * *'
-    
-    # 2. 昼〜夕方の部: 14:15 JST (05:15 UTC)
-    #    -> 20:00頃まで稼働
-    - cron: '15 5 * * *'
-
-    # 3. 夜〜ミッドナイトの部: 20:00 JST (11:00 UTC)
-    #    -> 23:55(終了)まで稼働
-    - cron: '0 11 * * *'
-    
-  workflow_dispatch:
+  workflow_dispatch: # 手動実行ボタン
+  push:              # push時にも実行
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  run-race-bot:
+  debug-runner:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6時間制限
-
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,36 +19,91 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then 
-            pip install -r requirements.txt
-          else
-            pip install pandas numpy lightgbm joblib beautifulsoup4 lxml curl_cffi requests groq
-          fi
+          # モデル読み込みに必要なライブラリを全網羅でインストール
+          pip install pandas numpy lightgbm joblib scikit-learn beautifulsoup4 lxml curl_cffi requests groq
 
-      - name: Run Bot
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          PYTHONUNBUFFERED: '1'
+      - name: Create Debug Script
+        # 診断用Pythonスクリプトをここで作成します
         run: |
-          python main.py
+          cat <<EOF > debug_model.py
+          import joblib
+          import os
+          import sys
+          import lightgbm
+          import pandas
+          import numpy
+          import traceback
 
-      - name: Save Database
-        if: always()
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "bot@noreply.github.com"
-          git fetch origin main
-          git reset --soft origin/main
-          git add race_data.db
-          if git diff --staged --quiet; then
-            echo "No changes."
-          else
-            git commit -m "Update DB [skip ci]"
-            git push origin main
-          fi
+          # scikit-learnバージョンの確認
+          try:
+              import sklearn
+              sklearn_version = sklearn.__version__
+          except ImportError:
+              sklearn_version = "未インストール"
+
+          MODEL_FILE = 'ultimate_boat_model.pkl'
+
+          print("="*60)
+          print("🔍 環境・モデル診断レポート")
+          print("="*60)
+
+          # 1. 環境情報の表示
+          print("[1] ライブラリバージョン")
+          print(f"Python: {sys.version.split()[0]}")
+          print(f"Pandas: {pandas.__version__}")
+          print(f"Numpy: {numpy.__version__}")
+          print(f"LightGBM: {lightgbm.__version__}")
+          print(f"Joblib: {joblib.__version__}")
+          print(f"Scikit-learn: {sklearn_version}")
+
+          # 2. ファイルの存在とサイズ確認
+          print("\n[2] モデルファイル診断")
+          if os.path.exists(MODEL_FILE):
+              size = os.path.getsize(MODEL_FILE)
+              mb_size = size / (1024*1024)
+              print(f"✅ ファイルが存在します: {MODEL_FILE}")
+              print(f"📦 サイズ: {mb_size:.2f} MB")
+              
+              if size < 2000: # 2KB以下ならGit LFSポインタの可能性大
+                  print("⚠️ 【警告】ファイルサイズが小さすぎます！Git LFSのポインタファイルの可能性があります。")
+                  with open(MODEL_FILE, 'r', errors='ignore') as f:
+                      head = f.read(100)
+                      print(f"   中身の先頭: {head}")
+          else:
+              print(f"❌ ファイルが見つかりません: {MODEL_FILE}")
+              print("   -> リポジトリのルートに .pkl ファイルがあるか確認してください。")
+              sys.exit(1)
+
+          # 3. ロードテスト
+          print("\n[3] ロードテスト実行")
+          try:
+              model = joblib.load(MODEL_FILE)
+              print("🎉 成功！モデルは正常に読み込めました。")
+              print(f"   Model Type: {type(model)}")
+              
+              if isinstance(model, dict):
+                  print(f"   Keys: {list(model.keys())}")
+              
+          except Exception as e:
+              print("💀 失敗！モデルの読み込みエラーが発生しました。")
+              print("-" * 40)
+              traceback.print_exc()
+              print("-" * 40)
+              print("【推測される原因】")
+              err_msg = str(e)
+              if "ModuleNotFoundError" in err_msg:
+                  print("-> 必要なライブラリが不足しています。エラーに出ているモジュールを追加してください。")
+              elif "attribute" in err_msg or "version" in err_msg:
+                  print("-> 学習環境(PC)と実行環境(GitHub)のライブラリバージョンが不一致です。")
+              elif "UnpicklingError" in err_msg:
+                  print("-> ファイルが破損しているか、Git LFSテキストデータのままです。")
+          
+          print("="*60)
+          EOF
+
+      - name: Run Debug
+        run: python debug_model.py
