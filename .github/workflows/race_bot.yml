@@ -2,8 +2,11 @@ name: Boat Race Bot
 
 on:
   schedule:
+    # 1. 朝の部 (08:30〜)
     - cron: '30 23 * * *'
+    # 2. 昼の部 (14:15〜)
     - cron: '15 5 * * *'
+    # 3. 夜の部 (20:00〜)
     - cron: '0 11 * * *'
   workflow_dispatch:
 
@@ -28,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # openai を削除。元の構成に戻します。
+          # openai を削除し、Groq公式構成に戻しました
           pip install pandas numpy lightgbm joblib beautifulsoup4 lxml curl_cffi requests groq scikit-learn
 
       - name: Run Bot
