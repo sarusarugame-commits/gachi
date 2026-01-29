@@ -1,251 +1,228 @@
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-import joblib
-import os
 import requests
+from bs4 import BeautifulSoup
+import datetime
+import os
+import re
+from itertools import permutations
 import time
-import json
-import traceback
-
-MODEL_FILE = 'ultimate_boat_model.pkl'
-STRATEGY_FILE = 'ultimate_winning_strategies.csv'
 
 # ==========================================
-# ⚙️ 本番運用設定
+# ⚙️ 設定エリア
 # ==========================================
-MIN_PROFIT = 1000   
-MIN_ROI = 110       
+MODEL_PATH = "boat_race_model_3t.txt"
 
-# Groq設定
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# 予想したい日（Noneなら「今日」）
+TARGET_DATE = None  # 例: "20260130"
 
-def ask_groq_reason(row, combo, ptype):
-    # ★修正: APIキーの前後の空白・改行を削除してクリーンにする
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    
-    print(f"🤖 Groq API呼び出し(requests): {combo}...", flush=True)
-    
-    if not api_key: 
-        print("❌ Groq Error: APIキーなし", flush=True)
-        return "AI解説: (APIキー設定なし)"
-    
-    def safe_get(key):
-        try:
-            val = row.get(key, 0)
-            if isinstance(val, (list, np.ndarray)):
-                return val[0] if len(val) > 0 else 0
-            return val
-        except:
-            return 0
-        
-    data_str = (
-        f"1号艇:勝率{safe_get('wr1')}\n"
-        f"2号艇:勝率{safe_get('wr2')}\n"
-        f"3号艇:勝率{safe_get('wr3')}\n"
-        f"4号艇:勝率{safe_get('wr4')}\n"
-    )
-    prompt = f"買い目「{combo}」({ptype})を推奨する理由を、競艇のプロとして100文字以内で断言せよ。\nデータ:\n{data_str}"
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a professional boat race analyst. Answer in Japanese."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 150
-    }
+# 【会場別】最適戦略ポートフォリオ
+# format: JCD: {'th': 閾値, 'k': 購入点数}
+# シミュレーション結果に基づき設定
+STRATEGY = {
+    1:  {'th': 0.065, 'k': 1},  # 桐生
+    2:  {'th': 0.050, 'k': 5},  # 戸田
+    3:  {'th': 0.060, 'k': 8},  # 江戸川
+    4:  {'th': 0.050, 'k': 5},  # 平和島
+    5:  {'th': 0.040, 'k': 1},  # 多摩川
+    7:  {'th': 0.065, 'k': 1},  # 蒲郡
+    8:  {'th': 0.070, 'k': 5},  # 常滑
+    9:  {'th': 0.055, 'k': 1},  # 津
+    10: {'th': 0.060, 'k': 8},  # 三国 (稼ぎ頭)
+    11: {'th': 0.045, 'k': 1},  # びわこ
+    12: {'th': 0.060, 'k': 1},  # 住之江
+    13: {'th': 0.040, 'k': 1},  # 尼崎
+    15: {'th': 0.065, 'k': 1},  # 丸亀
+    16: {'th': 0.055, 'k': 1},  # 児島
+    18: {'th': 0.070, 'k': 1},  # 徳山
+    19: {'th': 0.065, 'k': 1},  # 下関
+    20: {'th': 0.070, 'k': 8},  # 若松
+    21: {'th': 0.060, 'k': 1},  # 芦屋
+    22: {'th': 0.055, 'k': 1},  # 福岡
+}
 
-    # リトライ処理
-    for attempt in range(3):
-        try:
-            response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                content = data['choices'][0]['message']['content']
-                print(f"🤖 Groq応答成功", flush=True)
-                return content
-            else:
-                print(f"⚠️ Groq API Error {response.status_code}: {response.text}", flush=True)
-                time.sleep(2)
-                
-        except Exception as e:
-            print(f"⚠️ Groq Connection Error (Attempt {attempt+1}): {e}", flush=True)
-            time.sleep(2)
-
-    return "AI解説: (通信エラー)"
-
-# 再帰的クリーニング
-def unwrap_value(v):
-    if isinstance(v, (list, tuple, np.ndarray)):
-        if len(v) == 0: return 0.0
-        return unwrap_value(v[0])
-    if isinstance(v, str):
-        try:
-            return float(v.replace(',', '').replace('[','').replace(']','').strip())
-        except:
-            return 0.0
+# ==========================================
+# 1. スクレイピング関数
+# ==========================================
+def get_soup(url):
     try:
-        return float(v)
-    except:
-        return 0.0
+        res = requests.get(url, timeout=5)
+        res.encoding = res.apparent_encoding
+        return BeautifulSoup(res.text, 'html.parser')
+    except: return None
 
-def predict_race(raw_data):
-    recommendations = []
+def clean_text(text):
+    return text.replace("\n", "").replace(" ", "").strip()
+
+def scrape_race_info(jcd, rno, date_str):
+    base_url = "https://www.boatrace.jp/owpc/pc/race"
+    url_lst = f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
+    url_bef = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     
-    clean_data = {}
-    for k, v in raw_data.items():
-        clean_data[k] = unwrap_value(v)
-            
-    try:
-        if not os.path.exists(MODEL_FILE):
-            return []
-
-        models = joblib.load(MODEL_FILE)
-        
-        if 'features' in models:
-            required_feats = models['features']
-        else:
-            return []
-
-        df = pd.DataFrame([clean_data])
-        
-        for i in range(1, 7):
-            if f'wr{i}' not in df.columns: df[f'wr{i}'] = 0.0
-            if f'mo{i}' not in df.columns: df[f'mo{i}'] = 0.0
-            if f'ex{i}' not in df.columns: df[f'ex{i}'] = 0.0
-            if f'st{i}' not in df.columns: df[f'st{i}'] = 0.0
-
-        df['wr_mean'] = df[[f'wr{i}' for i in range(1, 7)]].mean(axis=1)
-        df['mo_mean'] = df[[f'mo{i}' for i in range(1, 7)]].mean(axis=1)
-        df['ex_mean'] = df[[f'ex{i}' for i in range(1, 7)]].mean(axis=1)
-        df['st_mean'] = df[[f'st{i}' for i in range(1, 7)]].mean(axis=1)
-
-        for i in range(1, 7):
-            df[f'wr{i}_rel'] = df[f'wr{i}'] - df['wr_mean']
-            df[f'mo{i}_rel'] = df[f'mo{i}'] - df['mo_mean']
-            df[f'ex{i}_rel'] = df['ex_mean'] - df[f'ex{i}'] 
-            df[f'st{i}_rel'] = df['st_mean'] - df[f'st{i}'] 
-        
-        df_final = pd.DataFrame()
-        for f in required_feats:
-            if f in df.columns:
-                df_final[f] = df[f]
-            else:
-                df_final[f] = 0.0
-        
-        X = df_final.values.astype(np.float32)
-        
+    soup_lst = get_soup(url_lst)
+    soup_bef = get_soup(url_bef)
+    
+    if not soup_lst: return None
+    
+    rows = []
+    wind = 0.0
+    if soup_bef:
         try:
-            def safe_predict_idx(model, input_x):
-                try:
-                    proba = model.predict_proba(input_x)
-                    return np.argmax(proba, axis=1)[0]
-                except:
-                    pass
-                
-                pred = model.predict(input_x)
-                if hasattr(pred, 'ndim') and pred.ndim == 2 and pred.shape[1] > 1:
-                    return np.argmax(pred, axis=1)[0]
-                
-                val = pred[0]
-                if hasattr(val, 'ndim') and val.ndim > 0:
-                    if val.size == 1:
-                        val = val.item()
-                    else:
-                        try: return np.argmax(val)
-                        except: val = val[0]
-                elif isinstance(val, (list, tuple)) and len(val) > 1:
-                     val = val[0]
-                return int(val) - 1
+            w_txt = soup_bef.select_one(".weather1_bodyUnitLabelData").text
+            m = re.search(r"(\d+)", clean_text(w_txt))
+            if m: wind = float(m.group(1))
+        except: pass
 
-            p1_idx = safe_predict_idx(models['r1'], X)
-            p2_idx = safe_predict_idx(models['r2'], X)
-            p3_idx = safe_predict_idx(models['r3'], X)
+    for i in range(1, 7):
+        row = {
+            'race_id': f"{date_str}_{jcd:02d}_{rno:02d}",
+            'date': int(date_str),
+            'jcd': jcd,
+            'wind': wind,
+            'boat_no': i,
+            'pid': 0, 'wr': 0.0, 'mo': 0.0, 'ex': 0.0, 'st': 0.20, 'f': 0
+        }
+        try:
+            tbody = soup_lst.select("tbody.is-fs12")[i-1]
+            pid_m = re.search(r"(\d{4})", tbody.select_one(".is-fs11").text)
+            if pid_m: row['pid'] = int(pid_m.group(1))
+            tds = tbody.select("td")
+            if len(tds) > 4:
+                m = re.search(r"(\d\.\d{2})", clean_text(tds[4].text))
+                if m: row['wr'] = float(m.group(1))
+            if len(tds) > 6:
+                txt = clean_text(tds[6].text)
+                m = re.search(r"(0\.\d{2})", txt)
+                if m: row['st'] = float(m.group(1))
+                mf = re.search(r"F(\d+)", txt)
+                if mf: row['f'] = int(mf.group(1))
+            if len(tds) > 7:
+                m = re.search(r"(\d{2}\.\d{2})", clean_text(tds[7].text))
+                if m: row['mo'] = float(m.group(1))
+        except: pass
 
-        except Exception as inner_e:
-            print(f"⚠️ Internal Predict Error: {inner_e}")
-            return []
+        if soup_bef:
+            try:
+                boat_td = soup_bef.select_one(f"td.is-boatColor{i}")
+                if boat_td:
+                    tr = boat_td.find_parent("tr")
+                    tds = tr.select("td")
+                    for td in tds[4:]:
+                        val = clean_text(td.text)
+                        if re.match(r"^\d\.\d{2}$", val):
+                            fval = float(val)
+                            if 6.0 <= fval <= 7.5:
+                                row['ex'] = fval
+                                break
+            except: pass
+        rows.append(row)
+    return pd.DataFrame(rows)
 
-        p1, p2, p3 = p1_idx + 1, p2_idx + 1, p3_idx + 1
-        
-    except Exception as e:
-        print(f"⚠️ AI Prediction Error: {e}", flush=True)
-        return [] 
+# ==========================================
+# 2. 予測関数
+# ==========================================
+def predict_race(model, df_race):
+    for col in ['wr', 'mo', 'ex', 'st']:
+        mean = df_race[col].mean()
+        std = df_race[col].std()
+        if std == 0: std = 1e-6
+        df_race[f'{col}_z'] = (df_race[col] - mean) / std
 
-    form_3t = f"{p1}-{p2}-{p3}"
-    form_2t = f"{p1}-{p2}"
+    df_race['jcd'] = df_race['jcd'].astype('category')
+    df_race['pid'] = df_race['pid'].astype('category')
     
-    strategies = None
-    try:
-        if os.path.exists(STRATEGY_FILE):
-            strategies = pd.read_csv(STRATEGY_FILE)
-    except: pass
+    features = [
+        'jcd', 'boat_no', 'wind', 'pid',
+        'wr', 'mo', 'ex', 'st', 'f',
+        'wr_z', 'mo_z', 'ex_z', 'st_z'
+    ]
+    
+    preds = model.predict(df_race[features])
+    df_race['p1'] = preds[:, 0]
+    df_race['p2'] = preds[:, 1]
+    df_race['p3'] = preds[:, 2]
+    
+    p1 = df_race['p1'].values
+    p2 = df_race['p2'].values
+    p3 = df_race['p3'].values
+    b = df_race['boat_no'].values
+    
+    combos = []
+    for i, j, k in permutations(range(6), 3):
+        score = p1[i] * p2[j] * p3[k]
+        combos.append({
+            'combo': f"{b[i]}-{b[j]}-{b[k]}",
+            'score': score
+        })
+    combos.sort(key=lambda x: x['score'], reverse=True)
+    return combos
 
-    # ★ 3連単
-    if p1 != p2 and p1 != p3 and p2 != p3:
-        profit, prob, roi = 0, 0, 0
-        valid = False
-        
-        if strategies is not None:
-            match = strategies[(strategies['券種'] == '3連単') & (strategies['買い目'] == form_3t)]
-            if not match.empty:
-                profit = int(match.iloc[0]['収支'])
-                prob = match.iloc[0]['的中率']
-                roi = match.iloc[0]['回収率']
-                
-                if profit >= MIN_PROFIT and roi >= MIN_ROI:
-                    valid = True
-                    print(f"✅ 採用: 3連単 {form_3t} (期待値:{profit}円)", flush=True)
-                else:
-                    print(f"🛑 却下: 3連単 {form_3t} (期待値:{profit}円)", flush=True)
-        
-        if valid:
-            reason = ask_groq_reason(clean_data, form_3t, "3連単")
-            recommendations.append({
-                'type': '3連単',
-                'combo': form_3t,
-                'prob': prob,
-                'profit': profit,
-                'roi': roi,
-                'reason': reason
-            })
+# ==========================================
+# メイン実行
+# ==========================================
+if __name__ == "__main__":
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ モデルファイルが見つかりません: {MODEL_PATH}")
+        exit()
 
-    # ★ 2連単
-    if p1 != p2:
-        profit, prob, roi = 0, 0, 0
-        valid = False
+    print("📂 モデルを読み込んでいます...")
+    model = lgb.Booster(model_file=MODEL_PATH)
+    
+    if TARGET_DATE is None:
+        today = datetime.date.today()
+        date_str = today.strftime("%Y%m%d")
+    else:
+        date_str = TARGET_DATE
         
-        if strategies is not None:
-            match = strategies[(strategies['券種'] == '2連単') & (strategies['買い目'] == form_2t)]
-            if not match.empty:
-                profit = int(match.iloc[0]['収支'])
-                prob = match.iloc[0]['的中率']
-                roi = match.iloc[0]['回収率']
-                
-                if profit >= MIN_PROFIT and roi >= MIN_ROI:
-                    valid = True
-                    print(f"✅ 採用: 2連単 {form_2t} (期待値:{profit}円)", flush=True)
-                else:
-                    print(f"🛑 却下: 2連単 {form_2t} (期待値:{profit}円)", flush=True)
-        
-        if valid:
-            reason = ask_groq_reason(clean_data, form_2t, "2連単")
-            recommendations.append({
-                'type': '2連単',
-                'combo': form_2t,
-                'prob': prob,
-                'profit': profit,
-                'roi': roi,
-                'reason': reason
-            })
+    print(f"🚀 {date_str} 本日の勝負レースを探索します...")
+    print("-" * 65)
+
+    hit_count = 0
+    total_cost = 0
+
+    # 全場チェック
+    # 戦略リストにある場だけチェックしてもいいが、一応全場見る
+    for jcd in range(1, 25):
+        # 戦略が定義されていない場はスキップ（利益が出ない場）
+        if jcd not in STRATEGY:
+            continue
             
-    return recommendations
+        strat = STRATEGY[jcd]
+        
+        for rno in range(1, 13):
+            # サーバー負荷軽減
+            time.sleep(0.05)
+            
+            # データ取得
+            df = scrape_race_info(jcd, rno, date_str)
+            if df is None or len(df) == 0: continue
+            
+            # 直前情報なし(ex=0)はスキップ
+            if df['ex'].sum() == 0: continue
+
+            try:
+                top_combos = predict_race(model, df)
+                best_score = top_combos[0]['score']
+                
+                # 戦略の閾値を超えているか？
+                if best_score >= strat['th']:
+                    hit_count += 1
+                    cost = strat['k'] * 100
+                    total_cost += cost
+                    
+                    print(f"🔥 {jcd:02}場 {rno:02}R | 自信度:{best_score:.4f} (基準 {strat['th']}) | {strat['k']}点買い")
+                    print(f"   [本命] {top_combos[0]['combo']}")
+                    
+                    if strat['k'] > 1:
+                        print(f"   [紐  ] {', '.join([c['combo'] for c in top_combos[1:strat['k']] ])}")
+                    
+                    print("-" * 65)
+                    
+            except: pass
+
+    if hit_count == 0:
+        print("🍵 現在、条件を満たすレースはありません。直前情報の更新を待ってください。")
+    else:
+        print(f"💰 合計 {hit_count} レース推奨 | 推定投資額: {total_cost:,} 円")
+        print("   Good Luck!")
