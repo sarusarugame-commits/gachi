@@ -1,179 +1,158 @@
-from curl_cffi import requests
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-import re
-import unicodedata
-import warnings
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+import os
+from itertools import permutations
 
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+# ==========================================
+# ⚙️ 設定・戦略
+# ==========================================
+MODEL_FILE = "boat_race_model_3t.txt"
 
-def clean_text(text):
-    if not text: return ""
-    text = unicodedata.normalize('NFKC', str(text))
-    return text.replace("\n", "").replace("\r", "").replace("¥", "").replace(",", "").strip()
+# グローバル変数でモデルを保持（毎回ロードしないためのキャッシュ）
+AI_MODEL = None
 
-def get_session():
-    # Chrome 120 偽装 (ブロック回避)
-    return requests.Session(impersonate="chrome120")
+# 【会場別】最適戦略ポートフォリオ
+# JCD: {'th': 自信度閾値, 'k': 購入点数}
+STRATEGY = {
+    1:  {'th': 0.065, 'k': 1},  # 桐生
+    2:  {'th': 0.050, 'k': 5},  # 戸田
+    3:  {'th': 0.060, 'k': 8},  # 江戸川
+    4:  {'th': 0.050, 'k': 5},  # 平和島
+    5:  {'th': 0.040, 'k': 1},  # 多摩川
+    7:  {'th': 0.065, 'k': 1},  # 蒲郡
+    8:  {'th': 0.070, 'k': 5},  # 常滑
+    9:  {'th': 0.055, 'k': 1},  # 津
+    10: {'th': 0.060, 'k': 8},  # 三国
+    11: {'th': 0.045, 'k': 1},  # びわこ
+    12: {'th': 0.060, 'k': 1},  # 住之江
+    13: {'th': 0.040, 'k': 1},  # 尼崎
+    15: {'th': 0.065, 'k': 1},  # 丸亀
+    16: {'th': 0.055, 'k': 1},  # 児島
+    18: {'th': 0.070, 'k': 1},  # 徳山
+    19: {'th': 0.065, 'k': 1},  # 下関
+    20: {'th': 0.070, 'k': 8},  # 若松
+    21: {'th': 0.060, 'k': 1},  # 芦屋
+    22: {'th': 0.055, 'k': 1},  # 福岡
+}
 
-def get_soup(session, url):
-    try:
-        res = session.get(url, timeout=10)
-        if res.status_code != 200: return None
-        if len(res.content) < 5000: return None # Block check
-        if "データがありません" in res.text: return None
-        return BeautifulSoup(res.content, 'lxml')
-    except: return None
-
-def scrape_race_data(session, jcd, rno, date_str):
-    base_url = "https://www.boatrace.jp/owpc/pc/race"
-    
-    # 3ページ全てにアクセス
-    soup_before = get_soup(session, f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}")
-    soup_list = get_soup(session, f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}")
-    soup_res = get_soup(session, f"{base_url}/raceresult?rno={rno}&jcd={jcd:02d}&hd={date_str}")
-
-    if not soup_before or not soup_list:
-        # 最低限、出走表がないと話にならない
-        return None, "NO_DATA"
-
-    # --- 1. 全42項目の初期化 (指定された順序) ---
-    row = {
-        'date': int(date_str), 'jcd': jcd, 'rno': rno, 'wind': 0.0,
-        'res1': 0, 'rank1': None, 'rank2': None, 'rank3': None,
-        'tansho': 0, 'nirentan': 0, 'sanrentan': 0, 'sanrenpuku': 0, 'payout': 0
-    }
-    # 各艇データ初期化
-    for i in range(1, 7):
-        row[f'wr{i}'] = 0.0
-        row[f'mo{i}'] = 0.0
-        row[f'ex{i}'] = 0.0
-        row[f'f{i}'] = 0
-        row[f'st{i}'] = 0.20
-
-    # --- 2. 天候・風 (BeforeInfo) ---
-    try:
-        # "Xm" を探すロジック
-        wind_txt = ""
-        # ラベルから探す
-        w_node = soup_before.select_one(".weather1_bodyUnitLabelData")
-        if w_node: wind_txt = w_node.text
+def load_model():
+    """モデルをロード（シングルトン）"""
+    global AI_MODEL
+    if AI_MODEL is None:
+        if os.path.exists(MODEL_FILE):
+            AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
         else:
-            # 見つからない場合は全テキストから検索
-            m = re.search(r"風.*?(\d+)m", soup_before.text)
-            if m: wind_txt = m.group(1)
-        
-        m = re.search(r"(\d+)", clean_text(wind_txt))
-        if m: row['wind'] = float(m.group(1))
-    except: pass
+            # モデルがない場合はNoneを返す（エラー回避）
+            return None
+    return AI_MODEL
 
-    # --- 3. 各艇データ (BeforeInfo & RaceList) ---
+def predict_race(raw):
+    """
+    main.py から渡された raw データ (dict) を使って予測する
+    """
+    # 1. モデルロード
+    model = load_model()
+    if model is None: return []
+
+    # 2. データ変換 (raw dict -> DataFrame)
+    # scraper.py の戻り値に合わせて展開
+    jcd = raw.get('jcd', 0)
+    wind = raw.get('wind', 0.0)
+    
+    # 戦略対象外の場ならスキップ（高速化）
+    if jcd not in STRATEGY:
+        return []
+
+    # 展示タイム(ex)が全員0なら予測不可としてスキップ
+    has_ex = sum([raw.get(f'ex{i}', 0) for i in range(1, 7)]) > 0
+    if not has_ex:
+        return []
+
+    rows = []
     for i in range(1, 7):
-        # 展示タイム (BeforeInfo)
-        try:
-            cell = soup_before.select_one(f".is-boatColor{i}")
-            if cell:
-                # ★修正箇所1: tbody -> tr に変更
-                # これで行全体ではなく、その艇の行だけを取得します
-                tds = cell.find_parent("tr").select("td")
-                if len(tds) > 4:
-                    val = clean_text(tds[4].text)
-                    if re.match(r"\d\.\d{2}", val): row[f'ex{i}'] = float(val)
-        except: pass
+        s = str(i)
+        row = {
+            'jcd': jcd,
+            'wind': wind,
+            'boat_no': i,
+            'pid': raw.get(f'pid{s}', 0),
+            'wr': raw.get(f'wr{s}', 0.0),
+            'mo': raw.get(f'mo{s}', 0.0),
+            'ex': raw.get(f'ex{s}', 0.0),
+            'st': raw.get(f'st{s}', 0.20),
+            'f': raw.get(f'f{s}', 0),
+        }
+        rows.append(row)
+    
+    df_race = pd.DataFrame(rows)
 
-        # 勝率・モーター・F・ST (RaceList)
-        try:
-            cell = soup_list.select_one(f".is-boatColor{i}")
-            if cell:
-                # ★修正箇所2: tbody -> tr に変更
-                tds = cell.find_parent("tr").select("td")
-                
-                # F数 / ST
-                if len(tds) > 3:
-                    txt = clean_text(tds[3].text)
-                    f_m = re.search(r"F(\d+)", txt)
-                    if f_m: row[f'f{i}'] = int(f_m.group(1))
-                    
-                    st_m = re.search(r"(\.\d{2}|\d\.\d{2})", txt)
-                    if st_m:
-                        v = float(st_m.group(1))
-                        if v < 1.0: row[f'st{i}'] = v
-                
-                # 勝率
-                if len(tds) > 4:
-                    txt = clean_text(tds[4].text)
-                    wr_m = re.search(r"(\d\.\d{2})", txt)
-                    if wr_m: row[f'wr{i}'] = float(wr_m.group(1))
-                
-                # モーター
-                if len(tds) > 6:
-                    txt = clean_text(tds[6].text)
-                    mo_m = re.findall(r"(\d{2,3}\.\d{2})", txt)
-                    if mo_m: row[f'mo{i}'] = float(mo_m[0])
-        except: pass
+    # 3. 前処理 (偏差値計算など)
+    # レース内偏差値を計算
+    for col in ['wr', 'mo', 'ex', 'st']:
+        mean = df_race[col].mean()
+        std = df_race[col].std()
+        if std == 0: std = 1e-6
+        df_race[f'{col}_z'] = (df_race[col] - mean) / std
 
-    # --- 4. レース結果 (RaceResult) ---
-    # まだレースが終わっていない場合は、ここは初期値(None/0)のままになる
-    if soup_res:
-        try:
-            # 順位 (rank1, rank2, rank3)
-            # is-w495 テーブルが着順表
-            ranks = soup_res.select("table.is-w495 tbody tr")
-            if len(ranks) >= 1:
-                r1 = clean_text(ranks[0].select("td")[1].text)
-                row['rank1'] = int(re.search(r"(\d)", r1).group(1))
-            if len(ranks) >= 2:
-                r2 = clean_text(ranks[1].select("td")[1].text)
-                row['rank2'] = int(re.search(r"(\d)", r2).group(1))
-            if len(ranks) >= 3:
-                r3 = clean_text(ranks[2].select("td")[1].text)
-                row['rank3'] = int(re.search(r"(\d)", r3).group(1))
-            
-            # res1 (1号艇が1着かどうか)
-            if row['rank1'] == 1:
-                row['res1'] = 1
-            else:
-                row['res1'] = 0
+    # カテゴリ型変換
+    df_race['jcd'] = df_race['jcd'].astype('category')
+    df_race['pid'] = df_race['pid'].astype('category')
+    
+    features = [
+        'jcd', 'boat_no', 'wind', 'pid',
+        'wr', 'mo', 'ex', 'st', 'f',
+        'wr_z', 'mo_z', 'ex_z', 'st_z'
+    ]
 
-            # 払い戻し
-            for tbl in soup_res.select("table"):
-                txt = clean_text(tbl.text)
-                if "勝" in txt or "連" in txt:
-                    for tr in tbl.select("tr"):
-                        tr_txt = clean_text(tr.text)
-                        
-                        pay = 0
-                        pay_node = tr.select_one(".is-payout1")
-                        if pay_node:
-                            p_txt = clean_text(pay_node.text).replace("¥","").replace(",","")
-                            if p_txt.isdigit(): pay = int(p_txt)
-
-                        if "3連単" in tr_txt:
-                            row['sanrentan'] = pay
-                            row['payout'] = pay # payoutは3連単配当を入れるのが一般的
-                        elif "3連複" in tr_txt:
-                            row['sanrenpuku'] = pay
-                        elif "2連単" in tr_txt:
-                            row['nirentan'] = pay
-                        elif "単勝" in tr_txt:
-                            row['tansho'] = pay
-        except: pass
-
-    # --- 締切時刻 (AI予測に必要なら残す、不要なら削除可) ---
-    row['deadline_time'] = "00:00"
+    # 4. 予測実行
     try:
-        tgt = soup_list.find(lambda t: "締切" in t.text)
-        if tgt:
-            tr = tgt.find_parent("tr")
-            cells = tr.find_all(['th','td'])
-            if len(cells) > rno:
-                m = re.search(r"(\d{2}:\d{2})", clean_text(cells[rno].text))
-                if m: row['deadline_time'] = m.group(1)
-    except: pass
+        preds = model.predict(df_race[features])
+        
+        # 3連単モデル(Multiclass)想定
+        if preds.shape[1] < 3:
+            return [] 
+            
+        p1_arr = preds[:, 0] # 1着率
+        p2_arr = preds[:, 1] # 2着率
+        p3_arr = preds[:, 2] # 3着率
+        
+    except Exception:
+        return []
 
-    return row, None
+    # 5. 買い目生成 (3連単全通りスコア計算)
+    b = df_race['boat_no'].values
+    combos = []
+    
+    for i, j, k in permutations(range(6), 3):
+        # 1-2-3 の確率は P(1が1着) * P(2が2着) * P(3が3着)
+        score = p1_arr[i] * p2_arr[j] * p3_arr[k]
+        combos.append({
+            'combo': f"{b[i]}-{b[j]}-{b[k]}",
+            'score': score
+        })
+    
+    # スコア順にソート
+    combos.sort(key=lambda x: x['score'], reverse=True)
+    
+    # 6. 戦略判定 & 返却
+    strat = STRATEGY[jcd]
+    best_bet = combos[0]
+    
+    # 閾値を超えていたら買い目を返す
+    if best_bet['score'] >= strat['th']:
+        buy_list = combos[:strat['k']]
+        results = []
+        
+        for item in buy_list:
+            results.append({
+                'combo': item['combo'],
+                'type': f"自信度{item['score']:.4f}", # main.pyのログ用
+                'profit': 0, # オッズ不明のため0 (main.py側で処理)
+                'prob': int(item['score'] * 100), # %表記
+                'roi': 0,
+                'reason': f"戦略適合(基準{strat['th']})"
+            })
+        return results
 
-# 互換性のためのダミー
-def scrape_result(session, jcd, rno, date_str):
-    return None
-def scrape_odds(session, jcd, rno, date_str, target_boat=None, target_combo=None):
-    return {}
+    return []
