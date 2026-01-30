@@ -50,11 +50,18 @@ def load_model():
     global AI_MODEL
     if AI_MODEL is None:
         if os.path.exists(MODEL_FILE):
+            print(f"📂 モデルファイルを検出: {MODEL_FILE}")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
         elif os.path.exists(MODEL_FILE.replace(".txt", ".zip")):
+            print(f"📦 ZIPモデルを解凍中: {MODEL_FILE.replace('.txt', '.zip')}")
             with zipfile.ZipFile(MODEL_FILE.replace(".txt", ".zip"), 'r') as z:
                 z.extractall(".")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
+        else:
+            # ★ ここでエラーを発生させる（カレントディレクトリのファイル一覧を表示）
+            cwd_files = os.listdir(".")
+            raise FileNotFoundError(f"モデルファイル '{MODEL_FILE}' が見つかりません。現在のディレクトリ: {os.getcwd()}, ファイル一覧: {cwd_files}")
+            
     return AI_MODEL
 
 def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
@@ -91,7 +98,7 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
 
     try:
-        # 短い待機（同時アクセス緩和）
+        # 短い待機
         time.sleep(random.uniform(0.5, 1.5))
         
         chat_completion = client.chat.completions.create(
@@ -110,24 +117,18 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
         return f"AI推奨（自信度{prob}%）※解説生成スキップ"
 
 def attach_reason(results, raw):
-    """
-    【新設】リスト確定後にAPIを叩いて解説を付与する関数
-    """
     if not results: return
     
-    # ランク1位の情報を元に解説を生成
     best_bet = results[0]
     combo = best_bet['combo']
     prob = best_bet['prob']
     jcd = raw.get('jcd', 0)
     
-    # ここでAPIコール！
     reason_msg = generate_reason_with_groq(
         jcd, [int(x) for x in combo.split('-')], 
         combo, prob, raw
     )
     
-    # 結果リストに理由を埋め込む
     for rank, item in enumerate(results):
         if rank == 0:
             item['reason'] = reason_msg
@@ -135,9 +136,9 @@ def attach_reason(results, raw):
             item['reason'] = "同上（抑え）"
 
 def predict_race(raw, odds_data=None):
+    # エラー時は例外をそのまま上に投げる
     model = load_model()
-    if model is None: return []
-
+    
     jcd = raw.get('jcd', 0)
     wind = raw.get('wind', 0.0)
     if jcd not in STRATEGY: return []
@@ -188,7 +189,6 @@ def predict_race(raw, odds_data=None):
     strat = STRATEGY[jcd]
     best_bet = combos[0]
 
-    # 閾値チェック（APIはまだ呼ばない）
     if best_bet['score'] >= strat['th']:
         results = []
         for rank, item in enumerate(combos[:strat['k']]):
@@ -199,7 +199,7 @@ def predict_race(raw, odds_data=None):
                 'profit': "計算中",
                 'prob': f"{prob_percent:.1f}",
                 'roi': 0,
-                'reason': "待機中...", # 後で埋める
+                'reason': "待機中...",
                 'deadline': raw.get('deadline_time', '不明')
             })
         return results
