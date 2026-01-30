@@ -12,32 +12,38 @@ def clean_text(text):
     return text.replace("\n", "").replace("\r", "").replace("¥", "").replace(",", "").strip()
 
 def get_session():
-    # Chrome 120 偽装 (ブロック回避)
+    # Chrome 120 偽装
     return requests.Session(impersonate="chrome120")
 
 def get_soup(session, url):
     try:
         res = session.get(url, timeout=10)
         if res.status_code != 200: return None
-        if len(res.content) < 3000: return None # Block check
+        if len(res.content) < 3000: return None 
         if "データがありません" in res.text: return None
         return BeautifulSoup(res.content, 'lxml')
     except: return None
 
 def scrape_race_data(session, jcd, rno, date_str):
     """
-    予想に必要なデータ（出走表、直前情報）を取得する
+    予想に必要なデータ（出走表、直前情報、締切時刻）を取得する
     """
     base_url = "https://www.boatrace.jp/owpc/pc/race"
     
-    soup_before = get_soup(session, f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}")
-    soup_list = get_soup(session, f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}")
+    url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
+    soup_before = get_soup(session, url_before)
+    
+    # beforeinfoが取れない場合、racelist（出走表）も確認
+    soup_list = None
+    if soup_before:
+        soup_list = get_soup(session, f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}")
 
     if not soup_before or not soup_list:
         return None, "NO_DATA"
 
     row = {
         'date': int(date_str), 'jcd': jcd, 'rno': rno, 'wind': 0.0,
+        'deadline_time': None, # ★追加
         # 各艇データ初期化
         'pid1':0, 'wr1':0.0, 'mo1':0.0, 'ex1':0.0, 'f1':0, 'st1':0.20,
         'pid2':0, 'wr2':0.0, 'mo2':0.0, 'ex2':0.0, 'f2':0, 'st2':0.20,
@@ -46,6 +52,17 @@ def scrape_race_data(session, jcd, rno, date_str):
         'pid5':0, 'wr5':0.0, 'mo5':0.0, 'ex5':0.0, 'f5':0, 'st5':0.20,
         'pid6':0, 'wr6':0.0, 'mo6':0.0, 'ex6':0.0, 'f6':0, 'st6':0.20,
     }
+
+    # --- 締切時刻の取得 (New) ---
+    try:
+        # ヘッダー付近のテキストから "締切予定 10:56" のようなパターンを探す
+        full_text = clean_text(soup_before.text)
+        # "締切予定 hh:mm" または単に "hh:mm" を探す
+        # ページの構造上、h2タグや特定のクラスにあることが多い
+        m = re.search(r"締切予定\s*(\d{1,2}:\d{2})", full_text)
+        if m:
+            row['deadline_time'] = m.group(1).zfill(5) # 08:30 のようにゼロ埋め
+    except: pass
 
     # --- 天候・風 ---
     try:
@@ -110,7 +127,7 @@ def scrape_race_data(session, jcd, rno, date_str):
 
 def scrape_result(session, jcd, rno, date_str):
     """
-    結果ページを解析し、決まり手と配当を返す (main.pyのreport_worker用)
+    結果ページを解析し、決まり手と配当を返す
     """
     url = f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup = get_soup(session, url)
@@ -126,8 +143,6 @@ def scrape_result(session, jcd, rno, date_str):
     }
 
     try:
-        # 配当テーブルを探す
-        # 通常、クラス名 is-w495 などがついているが、構造から探す
         tables = soup.select("table")
         for tbl in tables:
             txt = clean_text(tbl.text)
@@ -136,17 +151,12 @@ def scrape_result(session, jcd, rno, date_str):
                 for tr in rows:
                     row_txt = clean_text(tr.text)
                     
-                    # 組み合わせ (例: 1-2-3)
-                    # td class="is-payout2" にあることが多いが、構造が変わることもあるので
-                    # "numberSet1_number" クラスを探す
                     combo_node = tr.select(".numberSet1_number")
                     combo_text = ""
                     if combo_node:
-                        # 1, 2, 3 のように分かれているので結合
                         nums = [c.text.strip() for c in combo_node]
                         combo_text = "-".join(nums)
                     
-                    # 配当金
                     pay_node = tr.select_one(".is-payout1")
                     payout = 0
                     if pay_node:
@@ -160,18 +170,15 @@ def scrape_result(session, jcd, rno, date_str):
                         res['nirentan_combo'] = combo_text
                         res['nirentan_payout'] = payout
                     elif "単勝" in row_txt and combo_text:
-                        res['tansho_boat'] = combo_text # 単勝は "1" などの単一数字
+                        res['tansho_boat'] = combo_text
                         res['tansho_payout'] = payout
-
     except Exception:
         pass
 
-    # 結果が取れていなければNone (まだレース終わってない等)
     if not res['sanrentan_combo']:
         return None
         
     return res
 
 def scrape_odds(session, jcd, rno, date_str):
-    # 今回は使用しないので空実装でOK
     return {}
