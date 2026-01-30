@@ -12,7 +12,6 @@ def clean_text(text):
     return text.replace("\n", "").replace("\r", "").replace("¥", "").replace(",", "").strip()
 
 def get_session():
-    # Chrome 120 偽装
     return requests.Session(impersonate="chrome120")
 
 def get_soup(session, url):
@@ -30,20 +29,22 @@ def scrape_race_data(session, jcd, rno, date_str):
     """
     base_url = "https://www.boatrace.jp/owpc/pc/race"
     
+    # 直前情報と出走表の両方を取得（締切時刻取得の確実性を上げるため）
     url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_before = get_soup(session, url_before)
     
-    # beforeinfoが取れない場合、racelist（出走表）も確認
-    soup_list = None
-    if soup_before:
-        soup_list = get_soup(session, f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}")
+    url_list = f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
+    soup_list = get_soup(session, url_list)
 
-    if not soup_before or not soup_list:
+    if not soup_before and not soup_list:
         return None, "NO_DATA"
+
+    # メインは直前情報を使うが、なければ出走表で代用
+    main_soup = soup_before if soup_before else soup_list
 
     row = {
         'date': int(date_str), 'jcd': jcd, 'rno': rno, 'wind': 0.0,
-        'deadline_time': None, # ★追加
+        'deadline_time': None,
         # 各艇データ初期化
         'pid1':0, 'wr1':0.0, 'mo1':0.0, 'ex1':0.0, 'f1':0, 'st1':0.20,
         'pid2':0, 'wr2':0.0, 'mo2':0.0, 'ex2':0.0, 'f2':0, 'st2':0.20,
@@ -53,82 +54,83 @@ def scrape_race_data(session, jcd, rno, date_str):
         'pid6':0, 'wr6':0.0, 'mo6':0.0, 'ex6':0.0, 'f6':0, 'st6':0.20,
     }
 
-    # --- 締切時刻の取得 (New) ---
-    try:
-        # ヘッダー付近のテキストから "締切予定 10:56" のようなパターンを探す
-        full_text = clean_text(soup_before.text)
-        # "締切予定 hh:mm" または単に "hh:mm" を探す
-        # ページの構造上、h2タグや特定のクラスにあることが多い
-        m = re.search(r"締切予定\s*(\d{1,2}:\d{2})", full_text)
-        if m:
-            row['deadline_time'] = m.group(1).zfill(5) # 08:30 のようにゼロ埋め
-    except: pass
+    # --- 締切時刻の取得 (強化版) ---
+    # 直前情報と出走表のテキスト両方から探す
+    sources = []
+    if soup_before: sources.append(clean_text(soup_before.text))
+    if soup_list: sources.append(clean_text(soup_list.text))
+    
+    for text in sources:
+        # パターン1: "締切予定 10:30" や "締切10:30" (スペース有無問わず)
+        # パターン2: "予定 10:30"
+        match = re.search(r"(?:締切|予定).*?(\d{1,2}:\d{2})", text)
+        if match:
+            t_str = match.group(1).zfill(5) # 08:30
+            # 明らかにおかしい時間(00:00とか)でなければ採用
+            if "00:00" <= t_str <= "23:59":
+                row['deadline_time'] = t_str
+                break
 
     # --- 天候・風 ---
-    try:
-        w_node = soup_before.select_one(".weather1_bodyUnitLabelData")
-        wind_txt = w_node.text if w_node else ""
-        if not wind_txt:
-            m = re.search(r"風.*?(\d+)m", soup_before.text)
-            if m: wind_txt = m.group(1)
-        m = re.search(r"(\d+)", clean_text(wind_txt))
-        if m: row['wind'] = float(m.group(1))
-    except: pass
+    if soup_before:
+        try:
+            w_node = soup_before.select_one(".weather1_bodyUnitLabelData")
+            wind_txt = w_node.text if w_node else ""
+            if not wind_txt:
+                m = re.search(r"風.*?(\d+)m", soup_before.text)
+                if m: wind_txt = m.group(1)
+            m = re.search(r"(\d+)", clean_text(wind_txt))
+            if m: row['wind'] = float(m.group(1))
+        except: pass
 
     # --- 各艇データ ---
     for i in range(1, 7):
-        # 展示タイム
-        try:
-            cell = soup_before.select_one(f".is-boatColor{i}")
-            if cell:
-                tds = cell.find_parent("tr").select("td")
-                if len(tds) > 4:
-                    val = clean_text(tds[4].text)
-                    if re.match(r"\d\.\d{2}", val): row[f'ex{i}'] = float(val)
-        except: pass
+        # 展示タイム (soup_before)
+        if soup_before:
+            try:
+                cell = soup_before.select_one(f".is-boatColor{i}")
+                if cell:
+                    tds = cell.find_parent("tr").select("td")
+                    if len(tds) > 4:
+                        val = clean_text(tds[4].text)
+                        if re.match(r"\d\.\d{2}", val): row[f'ex{i}'] = float(val)
+            except: pass
 
-        # 出走表データ
-        try:
-            cell = soup_list.select_one(f".is-boatColor{i}")
-            if cell:
-                tbody = cell.find_parent("tbody")
-                # PID
-                pid_node = tbody.select_one(".is-fs11")
-                if pid_node:
-                    pm = re.search(r"(\d{4})", pid_node.text)
-                    if pm: row[f'pid{i}'] = int(pm.group(1))
+        # 出走表データ (soup_list)
+        if soup_list:
+            try:
+                cell = soup_list.select_one(f".is-boatColor{i}")
+                if cell:
+                    tbody = cell.find_parent("tbody")
+                    pid_node = tbody.select_one(".is-fs11")
+                    if pid_node:
+                        pm = re.search(r"(\d{4})", pid_node.text)
+                        if pm: row[f'pid{i}'] = int(pm.group(1))
 
-                tr = cell.find_parent("tr")
-                tds = tr.select("td")
-                
-                # F数 / ST
-                if len(tds) > 3:
-                    txt = clean_text(tds[3].text)
-                    f_m = re.search(r"F(\d+)", txt)
-                    if f_m: row[f'f{i}'] = int(f_m.group(1))
-                    st_m = re.search(r"(\.\d{2}|\d\.\d{2})", txt)
-                    if st_m:
-                        v = float(st_m.group(1))
-                        if v < 1.0: row[f'st{i}'] = v
-                # 勝率
-                if len(tds) > 4:
-                    txt = clean_text(tds[4].text)
-                    wr_m = re.search(r"(\d\.\d{2})", txt)
-                    if wr_m: row[f'wr{i}'] = float(wr_m.group(1))
-                # モーター
-                if len(tds) > 6:
-                    txt = clean_text(tds[6].text)
-                    mo_m = re.findall(r"(\d{2,3}\.\d{2})", txt)
-                    if mo_m: row[f'mo{i}'] = float(mo_m[0])
-        except: pass
+                    tr = cell.find_parent("tr")
+                    tds = tr.select("td")
+                    
+                    if len(tds) > 3:
+                        txt = clean_text(tds[3].text)
+                        f_m = re.search(r"F(\d+)", txt)
+                        if f_m: row[f'f{i}'] = int(f_m.group(1))
+                        st_m = re.search(r"(\.\d{2}|\d\.\d{2})", txt)
+                        if st_m:
+                            v = float(st_m.group(1))
+                            if v < 1.0: row[f'st{i}'] = v
+                    if len(tds) > 4:
+                        txt = clean_text(tds[4].text)
+                        wr_m = re.search(r"(\d\.\d{2})", txt)
+                        if wr_m: row[f'wr{i}'] = float(wr_m.group(1))
+                    if len(tds) > 6:
+                        txt = clean_text(tds[6].text)
+                        mo_m = re.findall(r"(\d{2,3}\.\d{2})", txt)
+                        if mo_m: row[f'mo{i}'] = float(mo_m[0])
+            except: pass
 
     return row, None
 
-
 def scrape_result(session, jcd, rno, date_str):
-    """
-    結果ページを解析し、決まり手と配当を返す
-    """
     url = f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup = get_soup(session, url)
     if not soup: return None
