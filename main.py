@@ -8,8 +8,9 @@ import sys
 import requests as std_requests
 import json
 
+# attach_reason をインポート
 from scraper import scrape_race_data, get_session, scrape_odds
-from predict_boat import predict_race
+from predict_boat import predict_race, attach_reason, load_model
 
 DB_FILE = "race_data.db"
 PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
@@ -17,8 +18,15 @@ JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 
 sys.stdout.reconfigure(encoding='utf-8')
 
+# DB書き込み競合を防ぐロック
+DB_LOCK = threading.Lock()
+
+# 統計用
+STATS = {"scanned": 0, "hits": 0, "errors": 0}
+STATS_LOCK = threading.Lock()
+
 def log(msg):
-    print(msg, flush=True)
+    print(f"[{datetime.datetime.now(JST).strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def send_discord(content):
     url = os.environ.get("DISCORD_WEBHOOK_URL")
@@ -33,58 +41,61 @@ def init_db():
     conn.close()
 
 def report_worker(stop_event):
+    log("ℹ️ レポート監視スレッド起動")
     while not stop_event.is_set():
         try:
-            conn = sqlite3.connect(DB_FILE)
-            conn.row_factory = sqlite3.Row
-            pending = conn.execute("SELECT * FROM history WHERE status='PENDING'").fetchall()
-            sess = get_session()
-            for p in pending:
-                try: jcd = int(p['race_id'].split('_')[1])
-                except: continue
+            with DB_LOCK:
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                pending = conn.execute("SELECT * FROM history WHERE status='PENDING'").fetchall()
+                sess = get_session()
                 
-                from scraper import scrape_result
-                res = scrape_result(sess, jcd, p['race_no'], p['date'])
-                if not res: continue
-
-                combo = p['predict_combo']
-                result_str = res.get('sanrentan_combo', '未確定')
-                payout = res.get('sanrentan_payout', 0)
-                
-                if result_str != "未確定":
-                    # 3連単1点1000円計算 (payoutは100円あたりの配当なので10倍)
-                    # ★ここを100円計算(payout - 100)にするなら適宜変更してください
-                    # 今回は前回の流れで1000円賭け想定のままにします
-                    actual_pay = payout * 10
-                    profit = int(actual_pay - 1000)
+                for p in pending:
+                    try: jcd = int(p['race_id'].split('_')[1])
+                    except: continue
                     
-                    conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, p['race_id']))
-                    conn.commit()
+                    from scraper import scrape_result
+                    res = scrape_result(sess, jcd, p['race_no'], p['date'])
+                    if not res: continue
 
-                    # ★ 本日トータル収支の計算
-                    today_str = p['date']
-                    total_profit = conn.execute("SELECT SUM(profit) FROM history WHERE date=? AND status='FINISHED'", (today_str,)).fetchone()[0]
-                    if total_profit is None: total_profit = 0
+                    combo = p['predict_combo']
+                    result_str = res.get('sanrentan_combo', '未確定')
+                    payout = res.get('sanrentan_payout', 0)
+                    
+                    if result_str != "未確定":
+                        actual_pay = payout * 10
+                        profit = int(actual_pay - 1000)
+                        
+                        conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, p['race_id']))
+                        conn.commit()
 
-                    if result_str == combo:
-                        msg = (
-                            f"🎯 **{p['place']}{p['race_no']}R** 的中！\n"
-                            f"買い目: {combo}\n"
-                            f"払戻: {actual_pay:,}円\n"
-                            f"収支: +{profit:,}円\n"
-                            f"📅 **本日トータル: {total_profit:+,}円**"
-                        )
-                        send_discord(msg)
-                    else:
-                        msg = (
-                            f"💀 **{p['place']}{p['race_no']}R** ハズレ\n"
-                            f"予想: {combo} (結果: {result_str})\n"
-                            f"📅 **本日トータル: {total_profit:+,}円**"
-                        )
-                        send_discord(msg)
+                        # 本日トータル
+                        today_str = p['date']
+                        total_profit = conn.execute("SELECT SUM(profit) FROM history WHERE date=? AND status='FINISHED'", (today_str,)).fetchone()[0]
+                        if total_profit is None: total_profit = 0
 
-            conn.close()
-        except: pass
+                        if result_str == combo:
+                            msg = (
+                                f"🎯 **{p['place']}{p['race_no']}R** 的中！\n"
+                                f"買い目: {combo}\n"
+                                f"払戻: {actual_pay:,}円\n"
+                                f"収支: +{profit:,}円\n"
+                                f"📅 **本日トータル: {total_profit:+,}円**"
+                            )
+                            log(f"🎯 的中: {p['place']}{p['race_no']}R ({combo}) +{profit}円")
+                            send_discord(msg)
+                        else:
+                            msg = (
+                                f"💀 **{p['place']}{p['race_no']}R** ハズレ\n"
+                                f"予想: {combo} (結果: {result_str})\n"
+                                f"📅 **本日トータル: {total_profit:+,}円**"
+                            )
+                            log(f"💀 ハズレ: {p['place']}{p['race_no']}R (結果:{result_str})")
+                            send_discord(msg)
+                conn.close()
+
+        except Exception as e:
+            log(f"⚠️ Report Worker Error: {e}")
         
         for _ in range(10):
             if stop_event.is_set(): break
@@ -94,31 +105,73 @@ def process_race(jcd, rno, today):
     sess = get_session()
     place = PLACE_NAMES.get(jcd, "不明")
     
-    try: raw, error = scrape_race_data(sess, jcd, rno, today)
-    except: return
-    if error or not raw: return
+    # 1. データ取得
+    try:
+        raw, error = scrape_race_data(sess, jcd, rno, today)
+    except Exception as e:
+        with STATS_LOCK: STATS["errors"] += 1
+        return
 
-    # oddsは取得しない（0円表示の原因になるため）
+    if error:
+        # データがない、開催されていない等の場合は静かに終了
+        return
+    if not raw:
+        with STATS_LOCK: STATS["errors"] += 1
+        return
+
+    # 2. 予測実行
+    try:
+        preds = predict_race(raw)
+    except Exception as e:
+        log(f"⚠️ 予測エラー {place}{rno}R: {e}")
+        with STATS_LOCK: STATS["errors"] += 1
+        return
+
+    # 統計更新
+    with STATS_LOCK: STATS["scanned"] += 1
+
+    if not preds:
+        return
+
+    # 3. DBチェック（新規か？）
+    new_preds = []
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE)
+        for p in preds:
+            combo = p['combo']
+            race_id = f"{today}_{jcd}_{rno}_{combo}"
+            exists = conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone()
+            if not exists:
+                new_preds.append(p)
+        conn.close()
     
-    try: preds = predict_race(raw)
-    except: return
-    if not preds: return
+    if not new_preds:
+        return
 
-    conn = sqlite3.connect(DB_FILE)
-    for p in preds:
-        combo = p['combo']
-        race_id = f"{today}_{jcd}_{rno}_{combo}"
-        exists = conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone()
-        
-        if not exists:
+    # 4. ★新規ヒット時のみAPIコール
+    log(f"⚡ {place}{rno}R で {len(new_preds)}件の候補を検知！AI解説を生成中...")
+    try:
+        attach_reason(preds, raw) # 参照渡しで new_preds も更新される
+    except Exception as e:
+        log(f"⚠️ 解説生成エラー: {e}")
+
+    # 5. 保存と通知
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE)
+        for p in new_preds:
+            combo = p['combo']
+            race_id = f"{today}_{jcd}_{rno}_{combo}"
+            
+            if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone():
+                continue
+
             prob = p['prob']
-            reason = p['reason']
-            deadline = p.get('deadline', '不明') # ★締切時刻
+            reason = p.get('reason', '解説取得失敗')
+            deadline = p.get('deadline', '不明')
             
             log(f"🔥 [HIT] {place}{rno}R -> {combo} (確率:{prob}%)")
             odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
 
-            # ★通知フォーマットを修正
             msg = (
                 f"🔥 **{place}{rno}R** 激アツ予想\n"
                 f"⏰ 締切: **{deadline}**\n"
@@ -132,17 +185,26 @@ def process_race(jcd, rno, today):
             conn.commit()
             send_discord(msg)
             
-    conn.close()
+            with STATS_LOCK: STATS["hits"] += 1
+            
+        conn.close()
 
 def main():
-    log("🚀 最強AI Bot (本番運用モード v2) 起動")
+    log("🚀 最強AI Bot (本番運用モード v3.1) 起動 - ログ強化版")
+    
+    try:
+        load_model()
+        log("✅ AIモデル読み込み完了")
+    except Exception as e:
+        log(f"❌ モデル読み込み致命的エラー: {e}")
+        return
+
     init_db()
     stop_event = threading.Event()
     t = threading.Thread(target=report_worker, args=(stop_event,), daemon=True)
     t.start()
     
     start_time = time.time()
-    # 稼働時間 (約5.8時間)
     MAX_RUNTIME = 21000 
 
     while True:
@@ -157,10 +219,26 @@ def main():
             
         today = now.strftime('%Y%m%d')
         
+        # 統計リセット
+        with STATS_LOCK:
+            STATS["scanned"] = 0
+            STATS["hits"] = 0
+            STATS["errors"] = 0
+
+        log(f"🔍 全レーススキャン開始 ({today})...")
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            futures = []
             for jcd in range(1, 25):
                 for rno in range(1, 13):
-                    ex.submit(process_race, jcd, rno, today)
+                    futures.append(ex.submit(process_race, jcd, rno, today))
+            
+            # 完了待ち
+            concurrent.futures.wait(futures)
+
+        # 結果サマリー表示
+        log(f"🏁 スキャン完了: チェック数={STATS['scanned']}, 新規HIT={STATS['hits']}, エラー={STATS['errors']}")
+        log("💤 待機中(300秒)...")
         time.sleep(300)
 
     stop_event.set()
