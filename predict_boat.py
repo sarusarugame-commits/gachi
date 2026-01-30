@@ -3,15 +3,36 @@ import numpy as np
 import lightgbm as lgb
 import os
 import zipfile
+import time
 from itertools import permutations
 import json
 
 # ★ GROQクライアントの準備
+GROQ_AVAILABLE = False
 try:
     from groq import Groq
     GROQ_AVAILABLE = True
 except ImportError:
     GROQ_AVAILABLE = False
+
+# グローバル変数としてクライアントを保持（接続プールの再利用のため）
+_GROQ_CLIENT = None
+
+def get_groq_client():
+    global _GROQ_CLIENT
+    if not GROQ_AVAILABLE:
+        return None
+    
+    if _GROQ_CLIENT is None:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if api_key:
+            try:
+                # タイムアウト設定を追加することを推奨（デフォルトは60秒だが明示）
+                _GROQ_CLIENT = Groq(api_key=api_key, max_retries=0) # 自前でリトライするのでライブラリ側は0
+            except Exception as e:
+                print(f"Groq Init Error: {e}")
+                return None
+    return _GROQ_CLIENT
 
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
@@ -41,54 +62,56 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
     Groq API (Llama 4 Scout) を使って解説を生成
     """
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not GROQ_AVAILABLE or not api_key:
+    client = get_groq_client()
+    if not client:
         return f"基準クリア（自信度{prob}%）"
 
-    try:
-        client = Groq(api_key=api_key)
-        
-        # 選手データの要約を作成
-        players_info = ""
-        for i in range(1, 7):
-            s = str(i)
-            pid = raw_data.get(f'pid{s}', 0)
-            wr = raw_data.get(f'wr{s}', 0.0)
-            mo = raw_data.get(f'mo{s}', 0.0)
-            ex = raw_data.get(f'ex{s}', 0.0)
-            st = raw_data.get(f'st{s}', 0.0)
-            players_info += f"{i}号艇: 勝率{wr:.2f} モータ{mo:.1f} 展示{ex:.2f} ST{st:.2f}\n"
+    # 選手データの要約を作成
+    players_info = ""
+    for i in range(1, 7):
+        s = str(i)
+        pid = raw_data.get(f'pid{s}', 0)
+        wr = raw_data.get(f'wr{s}', 0.0)
+        mo = raw_data.get(f'mo{s}', 0.0)
+        ex = raw_data.get(f'ex{s}', 0.0)
+        st = raw_data.get(f'st{s}', 0.0)
+        players_info += f"{i}号艇: 勝率{wr:.2f} モータ{mo:.1f} 展示{ex:.2f} ST{st:.2f}\n"
 
-        prompt = f"""
-        あなたは「Llama 4 Scout」です。鋭い観察眼を持つボートレースのスカウトマンとして振る舞ってください。
-        以下のレースデータに基づき、なぜ買い目「{combo}」が激アツなのか、50文字以内でズバリ解説してください。
-        データ（勝率、機力、展示）に基づいたプロの視点を入れてください。
+    prompt = f"""
+    あなたは「Llama 4 Scout」です。鋭い観察眼を持つボートレースのスカウトマンとして振る舞ってください。
+    以下のレースデータに基づき、なぜ買い目「{combo}」が激アツなのか、50文字以内でズバリ解説してください。
+    データ（勝率、機力、展示）に基づいたプロの視点を入れてください。
 
-        [レースデータ]
-        会場: {jcd}場
-        風速: {raw_data.get('wind', 0)}m
-        {players_info}
+    [レースデータ]
+    会場: {jcd}場
+    風速: {raw_data.get('wind', 0)}m
+    {players_info}
 
-        [AI予測]
-        推奨買い目: {combo}
-        当選確率: {prob}%
-        """
+    [AI予測]
+    推奨買い目: {combo}
+    当選確率: {prob}%
+    """
 
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "あなたはLlama 4 Scoutです。的確で冷徹なボートレース分析官です。"},
-                {"role": "user", "content": prompt}
-            ],
-            # ★ここを変更：Llama 4 Scoutを指定
-            model="llama-4-scout-17b-16e-instruct", 
-            temperature=0.7,
-            max_tokens=100,
-        )
-        return chat_completion.choices[0].message.content.strip()
-    except Exception as e:
-        # 万が一モデルIDが微妙に異なる場合のエラーハンドリング
-        print(f"Groq Error: {e}")
-        return f"基準クリア（自信度{prob}%）"
+    # リトライ処理（最大3回）
+    for attempt in range(3):
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "あなたはLlama 4 Scoutです。的確で冷徹なボートレース分析官です。"},
+                    {"role": "user", "content": prompt}
+                ],
+                model="llama-4-scout-17b-16e-instruct", 
+                temperature=0.7,
+                max_tokens=100,
+            )
+            return chat_completion.choices[0].message.content.strip()
+        except Exception as e:
+            # 接続エラー等の場合、少し待ってリトライ
+            if attempt < 2:
+                time.sleep(2)  # 2秒待機
+            else:
+                print(f"Groq Error (Final): {e}")
+                return f"基準クリア（自信度{prob}%）"
 
 def predict_race(raw, odds_data=None):
     model = load_model()
