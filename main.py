@@ -134,6 +134,7 @@ def process_race(jcd, rno, today):
         except:
             pass 
     else:
+        # 締切時刻が取れなかった場合、警告を出す（ここが重要）
         log(f"⚠️ {place}{rno}R: 締切時刻取得失敗 -> 強制チェック実行")
 
     try:
@@ -245,6 +246,7 @@ def main():
 
         log(f"🔍 全レーススキャン開始 ({today})...")
         
+        # スレッド数を10に強化
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             futures = []
             for jcd in range(1, 25):
