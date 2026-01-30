@@ -4,11 +4,18 @@ import lightgbm as lgb
 import os
 import zipfile
 from itertools import permutations
+import json
+
+# ★ GROQクライアントの準備
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
 
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
 
-# 【会場別】最適戦略ポートフォリオ
 STRATEGY = {
     1:  {'th': 0.065, 'k': 1}, 2:  {'th': 0.050, 'k': 5}, 3:  {'th': 0.060, 'k': 8},
     4:  {'th': 0.050, 'k': 5}, 5:  {'th': 0.040, 'k': 1}, 7:  {'th': 0.065, 'k': 1},
@@ -30,6 +37,59 @@ def load_model():
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
     return AI_MODEL
 
+def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
+    """
+    Groq API (Llama 4 Scout) を使って解説を生成
+    """
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not GROQ_AVAILABLE or not api_key:
+        return f"基準クリア（自信度{prob}%）"
+
+    try:
+        client = Groq(api_key=api_key)
+        
+        # 選手データの要約を作成
+        players_info = ""
+        for i in range(1, 7):
+            s = str(i)
+            pid = raw_data.get(f'pid{s}', 0)
+            wr = raw_data.get(f'wr{s}', 0.0)
+            mo = raw_data.get(f'mo{s}', 0.0)
+            ex = raw_data.get(f'ex{s}', 0.0)
+            st = raw_data.get(f'st{s}', 0.0)
+            players_info += f"{i}号艇: 勝率{wr:.2f} モータ{mo:.1f} 展示{ex:.2f} ST{st:.2f}\n"
+
+        prompt = f"""
+        あなたは「Llama 4 Scout」です。鋭い観察眼を持つボートレースのスカウトマンとして振る舞ってください。
+        以下のレースデータに基づき、なぜ買い目「{combo}」が激アツなのか、50文字以内でズバリ解説してください。
+        データ（勝率、機力、展示）に基づいたプロの視点を入れてください。
+
+        [レースデータ]
+        会場: {jcd}場
+        風速: {raw_data.get('wind', 0)}m
+        {players_info}
+
+        [AI予測]
+        推奨買い目: {combo}
+        当選確率: {prob}%
+        """
+
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "あなたはLlama 4 Scoutです。的確で冷徹なボートレース分析官です。"},
+                {"role": "user", "content": prompt}
+            ],
+            # ★ここを変更：Llama 4 Scoutを指定
+            model="llama-4-scout-17b-16e-instruct", 
+            temperature=0.7,
+            max_tokens=100,
+        )
+        return chat_completion.choices[0].message.content.strip()
+    except Exception as e:
+        # 万が一モデルIDが微妙に異なる場合のエラーハンドリング
+        print(f"Groq Error: {e}")
+        return f"基準クリア（自信度{prob}%）"
+
 def predict_race(raw, odds_data=None):
     model = load_model()
     if model is None: return []
@@ -38,7 +98,6 @@ def predict_race(raw, odds_data=None):
     wind = raw.get('wind', 0.0)
     if jcd not in STRATEGY: return []
     
-    # 展示タイムなしはスキップ
     if sum([raw.get(f'ex{i}', 0) for i in range(1, 7)]) == 0: return []
 
     rows = []
@@ -87,17 +146,17 @@ def predict_race(raw, odds_data=None):
 
     if best_bet['score'] >= strat['th']:
         results = []
+        # 解説生成
+        reason_msg = generate_reason_with_groq(
+            jcd, [int(x) for x in best_bet['combo'].split('-')], 
+            best_bet['combo'], 
+            f"{best_bet['score']*100:.1f}", 
+            raw
+        )
+        
         for rank, item in enumerate(combos[:strat['k']]):
             prob_percent = item['score'] * 100
-            
-            # ★ここが変わります：AI解説の生成ロジック
-            comment = "AI推奨"
-            if prob_percent > 10: comment = "🔥 超鉄板級！的中率極大"
-            elif prob_percent > 5: comment = "✨ かなり有望！本命サイド"
-            elif prob_percent > 2: comment = "👍 妙味あり！狙い目"
-            
-            # 理由付け
-            reason_msg = f"基準({strat['th']})クリア。{comment}"
+            current_reason = reason_msg if rank == 0 else "同上（抑え）"
 
             results.append({
                 'combo': item['combo'],
@@ -105,8 +164,8 @@ def predict_race(raw, odds_data=None):
                 'profit': "計算中",
                 'prob': f"{prob_percent:.1f}",
                 'roi': 0,
-                'reason': reason_msg,
-                'deadline': raw.get('deadline_time', '不明') # ★締切時刻を追加
+                'reason': current_reason,
+                'deadline': raw.get('deadline_time', '不明')
             })
         return results
 
