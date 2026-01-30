@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 import os
+import zipfile  # 追加
 from itertools import permutations
 
 # ==========================================
@@ -9,11 +10,10 @@ from itertools import permutations
 # ==========================================
 MODEL_FILE = "boat_race_model_3t.txt"
 
-# グローバル変数でモデルを保持（毎回ロードしないためのキャッシュ）
+# グローバル変数でモデルを保持
 AI_MODEL = None
 
 # 【会場別】最適戦略ポートフォリオ
-# JCD: {'th': 自信度閾値, 'k': 購入点数}
 STRATEGY = {
     1:  {'th': 0.065, 'k': 1},  # 桐生
     2:  {'th': 0.050, 'k': 5},  # 戸田
@@ -37,13 +37,27 @@ STRATEGY = {
 }
 
 def load_model():
-    """モデルをロード（シングルトン）"""
+    """モデルをロード（Zip対応版）"""
     global AI_MODEL
     if AI_MODEL is None:
+        # 1. txtがそのままあれば読む
         if os.path.exists(MODEL_FILE):
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
+        
+        # 2. txtがないけどzipがあるなら、解凍してから読む
+        elif os.path.exists(MODEL_FILE.replace(".txt", ".zip")):
+            zip_path = MODEL_FILE.replace(".txt", ".zip")
+            print(f"📦 モデル圧縮ファイルを発見: {zip_path}")
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as z:
+                    z.extractall(".") # カレントディレクトリに解凍
+                print("✅ 解凍成功！モデルをロードします。")
+                AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
+            except Exception as e:
+                print(f"❌ モデル解凍エラー: {e}")
+                return None
         else:
-            # モデルがない場合はNoneを返す（エラー回避）
+            print(f"❌ モデルファイルが見つかりません: {MODEL_FILE}")
             return None
     return AI_MODEL
 
@@ -51,23 +65,17 @@ def predict_race(raw):
     """
     main.py から渡された raw データ (dict) を使って予測する
     """
-    # 1. モデルロード
     model = load_model()
     if model is None: return []
 
-    # 2. データ変換 (raw dict -> DataFrame)
-    # scraper.py の戻り値に合わせて展開
     jcd = raw.get('jcd', 0)
     wind = raw.get('wind', 0.0)
     
-    # 戦略対象外の場ならスキップ（高速化）
-    if jcd not in STRATEGY:
-        return []
+    if jcd not in STRATEGY: return []
 
-    # 展示タイム(ex)が全員0なら予測不可としてスキップ
+    # 展示タイムなしはスキップ
     has_ex = sum([raw.get(f'ex{i}', 0) for i in range(1, 7)]) > 0
-    if not has_ex:
-        return []
+    if not has_ex: return []
 
     rows = []
     for i in range(1, 7):
@@ -87,15 +95,13 @@ def predict_race(raw):
     
     df_race = pd.DataFrame(rows)
 
-    # 3. 前処理 (偏差値計算など)
-    # レース内偏差値を計算
+    # 前処理
     for col in ['wr', 'mo', 'ex', 'st']:
         mean = df_race[col].mean()
         std = df_race[col].std()
         if std == 0: std = 1e-6
         df_race[f'{col}_z'] = (df_race[col] - mean) / std
 
-    # カテゴリ型変換
     df_race['jcd'] = df_race['jcd'].astype('category')
     df_race['pid'] = df_race['pid'].astype('category')
     
@@ -105,54 +111,34 @@ def predict_race(raw):
         'wr_z', 'mo_z', 'ex_z', 'st_z'
     ]
 
-    # 4. 予測実行
     try:
         preds = model.predict(df_race[features])
-        
-        # 3連単モデル(Multiclass)想定
-        if preds.shape[1] < 3:
-            return [] 
-            
-        p1_arr = preds[:, 0] # 1着率
-        p2_arr = preds[:, 1] # 2着率
-        p3_arr = preds[:, 2] # 3着率
-        
+        if preds.shape[1] < 3: return [] 
+        p1_arr, p2_arr, p3_arr = preds[:, 0], preds[:, 1], preds[:, 2]
     except Exception:
         return []
 
-    # 5. 買い目生成 (3連単全通りスコア計算)
+    # 3連単全通り
     b = df_race['boat_no'].values
     combos = []
-    
     for i, j, k in permutations(range(6), 3):
-        # 1-2-3 の確率は P(1が1着) * P(2が2着) * P(3が3着)
         score = p1_arr[i] * p2_arr[j] * p3_arr[k]
         combos.append({
             'combo': f"{b[i]}-{b[j]}-{b[k]}",
             'score': score
         })
     
-    # スコア順にソート
     combos.sort(key=lambda x: x['score'], reverse=True)
     
-    # 6. 戦略判定 & 返却
     strat = STRATEGY[jcd]
-    best_bet = combos[0]
-    
-    # 閾値を超えていたら買い目を返す
-    if best_bet['score'] >= strat['th']:
-        buy_list = combos[:strat['k']]
-        results = []
-        
-        for item in buy_list:
-            results.append({
-                'combo': item['combo'],
-                'type': f"自信度{item['score']:.4f}", # main.pyのログ用
-                'profit': 0, # オッズ不明のため0 (main.py側で処理)
-                'prob': int(item['score'] * 100), # %表記
-                'roi': 0,
-                'reason': f"戦略適合(基準{strat['th']})"
-            })
-        return results
+    if combos[0]['score'] >= strat['th']:
+        return [{
+            'combo': item['combo'],
+            'type': f"自信度{item['score']:.4f}",
+            'profit': 0,
+            'prob': int(item['score'] * 100),
+            'roi': 0,
+            'reason': f"戦略適合(基準{strat['th']})"
+        } for item in combos[:strat['k']]]
 
     return []
