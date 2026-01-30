@@ -24,11 +24,9 @@ FINISHED_RACES = set()
 FINISHED_RACES_LOCK = threading.Lock()
 
 def log(msg):
-    # 時刻付きログ
     print(f"[{datetime.datetime.now(JST).strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def error_log(msg):
-    # エラー用ログ（stderrに出力して目立たせる）
     print(f"[{datetime.datetime.now(JST).strftime('%H:%M:%S')}] ❌ {msg}", file=sys.stderr, flush=True)
 
 def send_discord(content):
@@ -121,6 +119,8 @@ def process_race(jcd, rno, today):
         return
 
     deadline_str = raw.get('deadline_time')
+    
+    # ★ ここでチェック
     if deadline_str:
         try:
             now = datetime.datetime.now(JST)
@@ -134,11 +134,14 @@ def process_race(jcd, rno, today):
                 return
         except:
             pass 
+    else:
+        # 締切時刻が取れなかった場合、スキップできないのでログを出す
+        # log(f"⚠️ {place}{rno}R: 締切時刻取得失敗 -> 強制チェック")
+        pass
 
     try:
         preds = predict_race(raw)
     except Exception as e:
-        # log(f"⚠️ 予測エラー {place}{rno}R: {e}")
         with STATS_LOCK: STATS["errors"] += 1
         return
 
@@ -200,16 +203,15 @@ def process_race(jcd, rno, today):
         conn.close()
 
 def main():
-    log("🚀 最強AI Bot (本番運用モード v3.3) 起動")
+    log("🚀 最強AI Bot (本番運用モード v3.4) 起動")
     
-    # 起動時の重要チェック（失敗時は強制終了してログに残す）
     try:
         load_model()
         log("✅ AIモデル読み込み完了")
     except Exception as e:
         error_log(f"FATAL: モデル読み込みに失敗しました。\n詳細: {e}")
         error_log("強制終了します。")
-        sys.exit(1) # ここで異常終了させる
+        sys.exit(1)
 
     init_db()
     stop_event = threading.Event()
