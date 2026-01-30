@@ -22,8 +22,12 @@ sys.stdout.reconfigure(encoding='utf-8')
 DB_LOCK = threading.Lock()
 
 # 統計用
-STATS = {"scanned": 0, "hits": 0, "errors": 0}
+STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0}
 STATS_LOCK = threading.Lock()
+
+# ★ 終了したレースを記憶するセット (jcd, rno)
+FINISHED_RACES = set()
+FINISHED_RACES_LOCK = threading.Lock()
 
 def log(msg):
     print(f"[{datetime.datetime.now(JST).strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -95,31 +99,54 @@ def report_worker(stop_event):
                 conn.close()
 
         except Exception as e:
-            log(f"⚠️ Report Worker Error: {e}")
+            pass
         
         for _ in range(10):
             if stop_event.is_set(): break
             time.sleep(60)
 
 def process_race(jcd, rno, today):
+    # ★ 1. 終了済みキャッシュの確認 (高速化)
+    with FINISHED_RACES_LOCK:
+        if (jcd, rno) in FINISHED_RACES:
+            with STATS_LOCK: STATS["skipped"] += 1
+            return
+
     sess = get_session()
     place = PLACE_NAMES.get(jcd, "不明")
     
-    # 1. データ取得
+    # 2. データ取得
     try:
         raw, error = scrape_race_data(sess, jcd, rno, today)
     except Exception as e:
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    if error:
-        # データがない、開催されていない等の場合は静かに終了
-        return
-    if not raw:
-        with STATS_LOCK: STATS["errors"] += 1
+    if error or not raw:
         return
 
-    # 2. 予測実行
+    # ★ 3. 締切時刻による判定 (スクレイピング結果から時刻取得)
+    deadline_str = raw.get('deadline_time')
+    if deadline_str:
+        try:
+            # 今日の日付 + 締切時刻 で datetime オブジェクト作成
+            now = datetime.datetime.now(JST)
+            # 文字列 "10:30" -> 時, 分
+            h, m = map(int, deadline_str.split(':'))
+            deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            
+            # レース時刻を過ぎていれば終了リストに入れて終了
+            # (少し余裕を持たせて +10分程度までは許容するか、厳密にするか。ここでは厳密に現在時刻と比較)
+            if now > deadline_dt:
+                with FINISHED_RACES_LOCK:
+                    FINISHED_RACES.add((jcd, rno))
+                # log(f"⏹️ {place}{rno}R は終了しました (締切 {deadline_str})")
+                with STATS_LOCK: STATS["skipped"] += 1
+                return
+        except:
+            pass # 時刻パース失敗時は続行
+
+    # 4. 予測実行
     try:
         preds = predict_race(raw)
     except Exception as e:
@@ -127,13 +154,12 @@ def process_race(jcd, rno, today):
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    # 統計更新
     with STATS_LOCK: STATS["scanned"] += 1
 
     if not preds:
         return
 
-    # 3. DBチェック（新規か？）
+    # 5. DBチェック（新規か？）
     new_preds = []
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE)
@@ -148,14 +174,14 @@ def process_race(jcd, rno, today):
     if not new_preds:
         return
 
-    # 4. ★新規ヒット時のみAPIコール
+    # 6. 新規ヒット時のみAPIコール
     log(f"⚡ {place}{rno}R で {len(new_preds)}件の候補を検知！AI解説を生成中...")
     try:
-        attach_reason(preds, raw) # 参照渡しで new_preds も更新される
+        attach_reason(preds, raw)
     except Exception as e:
         log(f"⚠️ 解説生成エラー: {e}")
 
-    # 5. 保存と通知
+    # 7. 保存と通知
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE)
         for p in new_preds:
@@ -170,78 +196,3 @@ def process_race(jcd, rno, today):
             deadline = p.get('deadline', '不明')
             
             log(f"🔥 [HIT] {place}{rno}R -> {combo} (確率:{prob}%)")
-            odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
-
-            msg = (
-                f"🔥 **{place}{rno}R** 激アツ予想\n"
-                f"⏰ 締切: **{deadline}**\n"
-                f"🎯 買い目: **{combo}**\n"
-                f"📊 当選確率: **{prob}%**\n"
-                f"📝 解説: {reason}\n"
-                f"🔗 [オッズ確認]({odds_url})"
-            )
-            
-            conn.execute("INSERT INTO history VALUES (?,?,?,?,?,?,?)", (race_id, today, place, rno, combo, 'PENDING', 0))
-            conn.commit()
-            send_discord(msg)
-            
-            with STATS_LOCK: STATS["hits"] += 1
-            
-        conn.close()
-
-def main():
-    log("🚀 最強AI Bot (本番運用モード v3.1) 起動 - ログ強化版")
-    
-    try:
-        load_model()
-        log("✅ AIモデル読み込み完了")
-    except Exception as e:
-        log(f"❌ モデル読み込み致命的エラー: {e}")
-        return
-
-    init_db()
-    stop_event = threading.Event()
-    t = threading.Thread(target=report_worker, args=(stop_event,), daemon=True)
-    t.start()
-    
-    start_time = time.time()
-    MAX_RUNTIME = 21000 
-
-    while True:
-        if time.time() - start_time > MAX_RUNTIME:
-            log("🔄 稼働時間上限により停止")
-            break
-        
-        now = datetime.datetime.now(JST)
-        if now.hour == 23 and now.minute >= 55:
-            log("🌙 ミッドナイト終了")
-            break
-            
-        today = now.strftime('%Y%m%d')
-        
-        # 統計リセット
-        with STATS_LOCK:
-            STATS["scanned"] = 0
-            STATS["hits"] = 0
-            STATS["errors"] = 0
-
-        log(f"🔍 全レーススキャン開始 ({today})...")
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-            futures = []
-            for jcd in range(1, 25):
-                for rno in range(1, 13):
-                    futures.append(ex.submit(process_race, jcd, rno, today))
-            
-            # 完了待ち
-            concurrent.futures.wait(futures)
-
-        # 結果サマリー表示
-        log(f"🏁 スキャン完了: チェック数={STATS['scanned']}, 新規HIT={STATS['hits']}, エラー={STATS['errors']}")
-        log("💤 待機中(300秒)...")
-        time.sleep(300)
-
-    stop_event.set()
-
-if __name__ == "__main__":
-    main()
