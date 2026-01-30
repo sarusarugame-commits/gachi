@@ -120,7 +120,6 @@ def process_race(jcd, rno, today):
 
     deadline_str = raw.get('deadline_time')
     
-    # ★ ここでチェック
     if deadline_str:
         try:
             now = datetime.datetime.now(JST)
@@ -135,9 +134,8 @@ def process_race(jcd, rno, today):
         except:
             pass 
     else:
-        # 締切時刻が取れなかった場合、スキップできないのでログを出す
-        # log(f"⚠️ {place}{rno}R: 締切時刻取得失敗 -> 強制チェック")
-        pass
+        # 締切時刻が取れなかった場合、警告を出す（ここが重要）
+        log(f"⚠️ {place}{rno}R: 締切時刻取得失敗 -> 強制チェック実行")
 
     try:
         preds = predict_race(raw)
@@ -203,7 +201,7 @@ def process_race(jcd, rno, today):
         conn.close()
 
 def main():
-    log("🚀 最強AI Bot (本番運用モード v3.4) 起動")
+    log("🚀 最強AI Bot (本番運用モード v3.5) 起動 - 締切時刻取得強化版")
     
     try:
         load_model()
@@ -248,7 +246,8 @@ def main():
 
         log(f"🔍 全レーススキャン開始 ({today})...")
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        # スレッド数を10に強化
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             futures = []
             for jcd in range(1, 25):
                 for rno in range(1, 13):
