@@ -4,18 +4,19 @@ import lightgbm as lgb
 import os
 import zipfile
 import time
+import random
 from itertools import permutations
 import json
 
 # ★ GROQクライアントの準備
 GROQ_AVAILABLE = False
 try:
-    from groq import Groq
+    from groq import Groq, APIConnectionError, RateLimitError
     GROQ_AVAILABLE = True
 except ImportError:
     GROQ_AVAILABLE = False
 
-# グローバル変数としてクライアントを保持（接続プールの再利用のため）
+# グローバル変数としてクライアントを保持
 _GROQ_CLIENT = None
 
 def get_groq_client():
@@ -27,8 +28,12 @@ def get_groq_client():
         api_key = os.environ.get("GROQ_API_KEY")
         if api_key:
             try:
-                # タイムアウト設定を追加することを推奨（デフォルトは60秒だが明示）
-                _GROQ_CLIENT = Groq(api_key=api_key, max_retries=0) # 自前でリトライするのでライブラリ側は0
+                # タイムアウトを少し長めに設定
+                _GROQ_CLIENT = Groq(
+                    api_key=api_key, 
+                    max_retries=2,
+                    timeout=20.0 
+                )
             except Exception as e:
                 print(f"Groq Init Error: {e}")
                 return None
@@ -60,58 +65,66 @@ def load_model():
 
 def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
-    Groq API (Llama 4 Scout) を使って解説を生成
+    Groq API を使って解説を生成（モデルランダム切り替え版）
     """
     client = get_groq_client()
     if not client:
         return f"基準クリア（自信度{prob}%）"
 
-    # 選手データの要約を作成
+    # ★ 2つのモデルを定義 (70BはLlama 3.3を使用)
+    models = [
+        "llama-4-scout-17b-16e-instruct", # ユーザー指定
+        "llama-3.3-70b-versatile"         # 70Bモデル
+    ]
+    # ランダムに選択して負荷分散
+    selected_model = random.choice(models)
+
+    # 選手データの要約
     players_info = ""
     for i in range(1, 7):
         s = str(i)
-        pid = raw_data.get(f'pid{s}', 0)
         wr = raw_data.get(f'wr{s}', 0.0)
         mo = raw_data.get(f'mo{s}', 0.0)
         ex = raw_data.get(f'ex{s}', 0.0)
         st = raw_data.get(f'st{s}', 0.0)
-        players_info += f"{i}号艇: 勝率{wr:.2f} モータ{mo:.1f} 展示{ex:.2f} ST{st:.2f}\n"
+        players_info += f"{i}号艇: 勝率{wr:.2f} 機力{mo:.1f} 展示{ex:.2f} ST{st:.2f}\n"
 
     prompt = f"""
-    あなたは「Llama 4 Scout」です。鋭い観察眼を持つボートレースのスカウトマンとして振る舞ってください。
-    以下のレースデータに基づき、なぜ買い目「{combo}」が激アツなのか、50文字以内でズバリ解説してください。
-    データ（勝率、機力、展示）に基づいたプロの視点を入れてください。
-
-    [レースデータ]
-    会場: {jcd}場
-    風速: {raw_data.get('wind', 0)}m
+    あなたはボートレースのプロ予想家です。
+    以下のデータに基づき、買い目「{combo}」を推奨する理由を50文字以内で簡潔に述べよ。
+    使用モデル: {selected_model}
+    
+    [データ]
+    会場: {jcd}場, 風速: {raw_data.get('wind', 0)}m
     {players_info}
-
-    [AI予測]
-    推奨買い目: {combo}
-    当選確率: {prob}%
+    [予測]
+    推奨: {combo}, 確率: {prob}%
     """
 
     # リトライ処理（最大3回）
     for attempt in range(3):
         try:
+            # ★ API制限対策: リクエスト前に少し待機 (1〜3秒)
+            time.sleep(random.uniform(1.0, 3.0))
+
             chat_completion = client.chat.completions.create(
                 messages=[
-                    {"role": "system", "content": "あなたはLlama 4 Scoutです。的確で冷徹なボートレース分析官です。"},
+                    {"role": "system", "content": "あなたは的確なボートレース分析官です。"},
                     {"role": "user", "content": prompt}
                 ],
-                model="llama-4-scout-17b-16e-instruct", 
+                model=selected_model, 
                 temperature=0.7,
-                max_tokens=100,
+                max_tokens=120,
             )
             return chat_completion.choices[0].message.content.strip()
+
         except Exception as e:
-            # 接続エラー等の場合、少し待ってリトライ
+            # エラー内容を少し詳細に出力（デバッグ用）
+            print(f"Groq Retry({attempt+1}/3) {selected_model}: {e}")
             if attempt < 2:
-                time.sleep(2)  # 2秒待機
+                time.sleep(5)  # エラー時は長めに待機 (5秒)
             else:
-                print(f"Groq Error (Final): {e}")
-                return f"基準クリア（自信度{prob}%）"
+                return f"AI解説取得エラー（確率{prob}%）"
 
 def predict_race(raw, odds_data=None):
     model = load_model()
