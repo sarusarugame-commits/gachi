@@ -11,12 +11,11 @@ import json
 # ★ GROQクライアントの準備
 GROQ_AVAILABLE = False
 try:
-    from groq import Groq, APIConnectionError, RateLimitError
+    from groq import Groq
     GROQ_AVAILABLE = True
 except ImportError:
     GROQ_AVAILABLE = False
 
-# グローバル変数としてクライアントを保持
 _GROQ_CLIENT = None
 
 def get_groq_client():
@@ -28,12 +27,7 @@ def get_groq_client():
         api_key = os.environ.get("GROQ_API_KEY")
         if api_key:
             try:
-                # タイムアウトを少し長めに設定
-                _GROQ_CLIENT = Groq(
-                    api_key=api_key, 
-                    max_retries=2,
-                    timeout=20.0 
-                )
+                _GROQ_CLIENT = Groq(api_key=api_key, max_retries=0, timeout=10.0)
             except Exception as e:
                 print(f"Groq Init Error: {e}")
                 return None
@@ -65,18 +59,14 @@ def load_model():
 
 def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
-    Groq API を使って解説を生成（モデルランダム切り替え版）
+    Groq API を使って解説を生成
     """
     client = get_groq_client()
     if not client:
         return f"基準クリア（自信度{prob}%）"
 
-    # ★ 2つのモデルを定義 (70BはLlama 3.3を使用)
-    models = [
-        "llama-4-scout-17b-16e-instruct", # ユーザー指定
-        "llama-3.3-70b-versatile"         # 70Bモデル
-    ]
-    # ランダムに選択して負荷分散
+    # モデルランダム選択
+    models = ["llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile"]
     selected_model = random.choice(models)
 
     # 選手データの要約
@@ -92,7 +82,6 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     prompt = f"""
     あなたはボートレースのプロ予想家です。
     以下のデータに基づき、買い目「{combo}」を推奨する理由を50文字以内で簡潔に述べよ。
-    使用モデル: {selected_model}
     
     [データ]
     会場: {jcd}場, 風速: {raw_data.get('wind', 0)}m
@@ -101,30 +90,49 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     推奨: {combo}, 確率: {prob}%
     """
 
-    # リトライ処理（最大3回）
-    for attempt in range(3):
-        try:
-            # ★ API制限対策: リクエスト前に少し待機 (1〜3秒)
-            time.sleep(random.uniform(1.0, 3.0))
+    try:
+        # 短い待機（同時アクセス緩和）
+        time.sleep(random.uniform(0.5, 1.5))
+        
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "あなたは的確なボートレース分析官です。"},
+                {"role": "user", "content": prompt}
+            ],
+            model=selected_model, 
+            temperature=0.7,
+            max_tokens=100,
+        )
+        return chat_completion.choices[0].message.content.strip()
 
-            chat_completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "あなたは的確なボートレース分析官です。"},
-                    {"role": "user", "content": prompt}
-                ],
-                model=selected_model, 
-                temperature=0.7,
-                max_tokens=120,
-            )
-            return chat_completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Groq Skip ({selected_model}): {e}")
+        return f"AI推奨（自信度{prob}%）※解説生成スキップ"
 
-        except Exception as e:
-            # エラー内容を少し詳細に出力（デバッグ用）
-            print(f"Groq Retry({attempt+1}/3) {selected_model}: {e}")
-            if attempt < 2:
-                time.sleep(5)  # エラー時は長めに待機 (5秒)
-            else:
-                return f"AI解説取得エラー（確率{prob}%）"
+def attach_reason(results, raw):
+    """
+    【新設】リスト確定後にAPIを叩いて解説を付与する関数
+    """
+    if not results: return
+    
+    # ランク1位の情報を元に解説を生成
+    best_bet = results[0]
+    combo = best_bet['combo']
+    prob = best_bet['prob']
+    jcd = raw.get('jcd', 0)
+    
+    # ここでAPIコール！
+    reason_msg = generate_reason_with_groq(
+        jcd, [int(x) for x in combo.split('-')], 
+        combo, prob, raw
+    )
+    
+    # 結果リストに理由を埋め込む
+    for rank, item in enumerate(results):
+        if rank == 0:
+            item['reason'] = reason_msg
+        else:
+            item['reason'] = "同上（抑え）"
 
 def predict_race(raw, odds_data=None):
     model = load_model()
@@ -180,27 +188,18 @@ def predict_race(raw, odds_data=None):
     strat = STRATEGY[jcd]
     best_bet = combos[0]
 
+    # 閾値チェック（APIはまだ呼ばない）
     if best_bet['score'] >= strat['th']:
         results = []
-        # 解説生成
-        reason_msg = generate_reason_with_groq(
-            jcd, [int(x) for x in best_bet['combo'].split('-')], 
-            best_bet['combo'], 
-            f"{best_bet['score']*100:.1f}", 
-            raw
-        )
-        
         for rank, item in enumerate(combos[:strat['k']]):
             prob_percent = item['score'] * 100
-            current_reason = reason_msg if rank == 0 else "同上（抑え）"
-
             results.append({
                 'combo': item['combo'],
                 'type': f"ランク{rank+1}",
                 'profit': "計算中",
                 'prob': f"{prob_percent:.1f}",
                 'roi': 0,
-                'reason': current_reason,
+                'reason': "待機中...", # 後で埋める
                 'deadline': raw.get('deadline_time', '不明')
             })
         return results
