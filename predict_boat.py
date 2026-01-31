@@ -8,14 +8,13 @@ import random
 from itertools import permutations
 import json
 
-# ★ GROQクライアントの準備（エラーログ強化版）
+# ★ GROQ SDKの準備
 GROQ_AVAILABLE = False
 try:
     from groq import Groq
     GROQ_AVAILABLE = True
 except ImportError:
-    GROQ_AVAILABLE = False
-    print("⚠️ 'groq' ライブラリが見つかりません。pip install groq を実行してください。")
+    print("⚠️ 'groq' ライブラリが見つかりません。")
 
 _GROQ_CLIENT = None
 
@@ -27,26 +26,27 @@ def get_groq_client():
     if _GROQ_CLIENT is None:
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
-            print("⚠️ 環境変数 'GROQ_API_KEY' が設定されていません。")
             return None
             
         try:
-            _GROQ_CLIENT = Groq(api_key=api_key, max_retries=0, timeout=10.0)
+            # ★ SDK標準のリトライ機能を使用 (max_retries=5)
+            # Connection error や 429 Too Many Requests に対して自動で指数バックオフを行う
+            _GROQ_CLIENT = Groq(
+                api_key=api_key, 
+                max_retries=5, 
+                timeout=20.0
+            )
         except Exception as e:
-            print(f"❌ Groqクライアント初期化エラー: {e}")
+            print(f"❌ Groq Init Error: {e}")
             return None
     return _GROQ_CLIENT
 
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
 
-# ★【厳選設定】1日2〜3レースを狙うため、閾値を 0.040 (4.0%) に設定
-# 点数(k)は5点のまま維持（的中率確保のため）
+# ★【厳選設定】1日2〜3レース狙い (閾値 4.0%)
 STRATEGY_DEFAULT = {'th': 0.040, 'k': 5}
-STRATEGY = {
-    # 特定の場だけ調整したい場合はここに記述
-    # 例: 1: {'th': 0.045, 'k': 5}, 
-}
+STRATEGY = {}
 
 def load_model():
     global AI_MODEL
@@ -60,14 +60,12 @@ def load_model():
                 z.extractall(".")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
         else:
-            cwd_files = os.listdir(".")
             raise FileNotFoundError(f"モデルファイル '{MODEL_FILE}' が見つかりません。")
-            
     return AI_MODEL
 
 def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
-    Groq API を使って解説を生成
+    Groq API を使って解説を生成 (SDK標準機能版)
     """
     client = get_groq_client()
     if not client:
@@ -97,8 +95,7 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
 
     try:
-        time.sleep(random.uniform(0.5, 1.5))
-        
+        # SDKのリトライ機能に任せてシンプルに呼び出す
         chat_completion = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": "あなたは的確なボートレース分析官です。"},
@@ -111,8 +108,9 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
         return chat_completion.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"⚠️ Groq API呼び出しエラー ({selected_model}): {e}")
-        return f"AI推奨（自信度{prob}%）※解説生成失敗"
+        # SDKがリトライしてもダメだった場合の最終エラー
+        print(f"⚠️ Groq API Failed ({selected_model}): {e}")
+        return f"AI推奨（自信度{prob}%）"
 
 def attach_reason(results, raw):
     if not results: return
@@ -140,12 +138,11 @@ def predict_race(raw, odds_data=None):
     wind = raw.get('wind', 0.0)
     rno = raw.get('rno', 0)
     
-    # デフォルト設定を使用
     strat = STRATEGY.get(jcd, STRATEGY_DEFAULT)
     
     ex_values = [raw.get(f'ex{i}', 0) for i in range(1, 7)]
     if sum(ex_values) == 0:
-        print(f"⚠️ {jcd}場{rno}R: 展示タイムなし -> スキップ (Ex: {ex_values})")
+        # print(f"⚠️ {jcd}場{rno}R: 展示タイムなし -> スキップ")
         return []
 
     rows = []
@@ -193,14 +190,12 @@ def predict_race(raw, odds_data=None):
     
     best_bet = combos[0]
 
-    # 閾値チェック (ログ出力付き)
+    # 閾値チェック (ログ出力)
     if best_bet['score'] < strat['th']:
-        # 3.5%以上なら「惜しい」ログを出す
         if best_bet['score'] > 0.035:
              print(f"📉 {jcd}場{rno}R: スコア不足 (Best: {best_bet['score']*100:.2f}% / 必要: {strat['th']*100:.1f}%) -> {best_bet['combo']}")
         return []
 
-    # 合格
     results = []
     for rank, item in enumerate(combos[:strat['k']]):
         prob_percent = item['score'] * 100
