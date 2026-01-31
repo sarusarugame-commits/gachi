@@ -126,14 +126,12 @@ def process_race(jcd, rno, today):
             h, m = map(int, deadline_str.split(':'))
             deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
             
-            # 既に終了
             if now > deadline_dt:
                 with FINISHED_RACES_LOCK:
                     FINISHED_RACES.add((jcd, rno))
                 with STATS_LOCK: STATS["skipped"] += 1
                 return
 
-            # まだ60分以上先
             if deadline_dt > (now + datetime.timedelta(minutes=60)):
                 with STATS_LOCK: STATS["skipped"] += 1
                 return
@@ -248,7 +246,6 @@ def main():
 
         log(f"🔍 直近のレースをスキャン中 ({today})...")
         
-        # 1-12R順にスキャン
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             futures = []
             for rno in range(1, 13):
