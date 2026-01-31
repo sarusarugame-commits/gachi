@@ -8,7 +8,7 @@ import sys
 import requests as std_requests
 import json
 
-from scraper import scrape_race_data, get_session, scrape_odds
+from scraper import scrape_race_data, get_session, scrape_odds, get_exact_odds
 from predict_boat import predict_race, attach_reason, load_model
 
 DB_FILE = "race_data.db"
@@ -18,9 +18,10 @@ JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 sys.stdout.reconfigure(encoding='utf-8')
 
 DB_LOCK = threading.Lock()
-# 統計用
 STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0}
 STATS_LOCK = threading.Lock()
+FINISHED_RACES = set()
+FINISHED_RACES_LOCK = threading.Lock()
 
 def log(msg):
     print(f"[{datetime.datetime.now(JST).strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -41,7 +42,7 @@ def init_db():
     conn.close()
 
 def report_worker(stop_event):
-    log("ℹ️ レポート監視スレッド起動 (100円投資モード)")
+    log("ℹ️ レポート監視スレッド起動 (1点100円計算)")
     while not stop_event.is_set():
         try:
             with DB_LOCK:
@@ -63,7 +64,6 @@ def report_worker(stop_event):
                     payout = res.get('sanrentan_payout', 0)
                     
                     if result_str != "未確定":
-                        # ★修正: 100円投資計算
                         if result_str == combo:
                             profit = payout - 100
                         else:
@@ -103,64 +103,51 @@ def report_worker(stop_event):
             time.sleep(60)
 
 def process_race(jcd, rno, today):
+    with FINISHED_RACES_LOCK:
+        if (jcd, rno) in FINISHED_RACES:
+            with STATS_LOCK: STATS["skipped"] += 1
+            return
+
     sess = get_session()
     place = PLACE_NAMES.get(jcd, "不明")
     
-    # 1. データ取得
     try:
         raw, error = scrape_race_data(sess, jcd, rno, today)
     except Exception as e:
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    if error or not raw:
-        return
+    if error or not raw: return
 
-    # ★ 2. タイムフィルター (超重要)
-    # 締切時刻をチェックし、「終わったレース」や「まだ先のレース」を弾く
     deadline_str = raw.get('deadline_time')
-    
     if deadline_str:
         try:
             now = datetime.datetime.now(JST)
             h, m = map(int, deadline_str.split(':'))
             deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
             
-            # 日付またぎ対応（もし深夜レースなどで日付が変わる場合への保険）
-            # 基本は当日比較でOK
-            
-            # 判定A: 既に終わっている（現在時刻 > 締切）
+            # 既に終了
             if now > deadline_dt:
-                # log(f"⏹️ {place}{rno}R: 終了済み (締切 {deadline_str})")
+                with FINISHED_RACES_LOCK:
+                    FINISHED_RACES.add((jcd, rno))
                 with STATS_LOCK: STATS["skipped"] += 1
                 return
 
-            # 判定B: まだ先すぎる（締切 > 現在時刻 + 60分）
-            # ※「朝に夜のレース通知はいらない」に対応
+            # まだ60分以上先
             if deadline_dt > (now + datetime.timedelta(minutes=60)):
-                # log(f"⏳ {place}{rno}R: まだ先です (締切 {deadline_str})")
                 with STATS_LOCK: STATS["skipped"] += 1
                 return
-                
-        except:
-            pass 
-    else:
-        # 締切時刻が取れない場合は、念のためチェックする（ログは出す）
-        log(f"⚠️ {place}{rno}R: 締切時刻不明 -> 強制チェック")
+        except: pass
 
-    # 3. 予測実行
     try:
         preds = predict_race(raw)
-    except Exception as e:
+    except:
         with STATS_LOCK: STATS["errors"] += 1
         return
 
     with STATS_LOCK: STATS["scanned"] += 1
+    if not preds: return
 
-    if not preds:
-        return
-
-    # 4. DBチェック & 保存
     new_preds = []
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE)
@@ -172,30 +159,39 @@ def process_race(jcd, rno, today):
                 new_preds.append(p)
         conn.close()
     
-    if not new_preds:
-        return
+    if not new_preds: return
 
-    # 5. 解説生成 & 通知
-    log(f"⚡ {place}{rno}R で {len(new_preds)}件の候補を検知！AI解説を生成中...")
+    log(f"⚡ {place}{rno}R で {len(new_preds)}件の候補を検知！オッズ取得＆AI解説生成中...")
+    
+    # オッズ取得
+    best_combo = new_preds[0]['combo']
+    odds_val = None
     try:
-        attach_reason(preds, raw)
+        odds_val = get_exact_odds(sess, jcd, rno, today, best_combo)
+        if odds_val:
+            log(f"💰 {place}{rno}R: 現在オッズ {odds_val}倍 を取得")
     except Exception as e:
-        log(f"⚠️ 解説生成エラー: {e}")
+        log(f"⚠️ オッズ取得失敗: {e}")
+
+    try:
+        attach_reason(preds, raw, odds_val)
+    except Exception as e:
+        log(f"⚠️ 解説エラー: {e}")
 
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE)
         for p in new_preds:
             combo = p['combo']
             race_id = f"{today}_{jcd}_{rno}_{combo}"
-            
-            if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone():
-                continue
+            if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone(): continue
 
             prob = p['prob']
             reason = p.get('reason', '解説取得失敗')
             deadline = p.get('deadline', '不明')
             
-            log(f"🔥 [HIT] {place}{rno}R -> {combo} (確率:{prob}%)")
+            odds_log = f"({p.get('odds')}倍)" if p.get('odds') else ""
+            log(f"🔥 [HIT] {place}{rno}R -> {combo} (確率:{prob}%) {odds_log}")
+            
             odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
 
             msg = (
@@ -203,6 +199,7 @@ def process_race(jcd, rno, today):
                 f"⏰ 締切: **{deadline}**\n"
                 f"🎯 買い目: **{combo}**\n"
                 f"📊 当選確率: **{prob}%**\n"
+                f"💰 現在オッズ: **{odds_val if odds_val else '不明'}倍**\n"
                 f"📝 解説: {reason}\n"
                 f"🔗 [オッズ確認]({odds_url})"
             )
@@ -211,18 +208,16 @@ def process_race(jcd, rno, today):
             conn.commit()
             send_discord(msg)
             with STATS_LOCK: STATS["hits"] += 1
-            
         conn.close()
 
 def main():
-    log("🚀 最強AI Bot (本番運用モード v3.7) 起動 - 100円投資 & 直近レース厳選版")
+    log("🚀 最強AI Bot (本番運用モード v4.0) 起動 - オッズ分析機能搭載")
     
     try:
         load_model()
         log("✅ AIモデル読み込み完了")
     except Exception as e:
-        error_log(f"FATAL: モデル読み込みに失敗しました。\n詳細: {e}")
-        error_log("強制終了します。")
+        error_log(f"FATAL: モデル読み込みエラー: {e}")
         sys.exit(1)
 
     init_db()
@@ -253,14 +248,11 @@ def main():
 
         log(f"🔍 直近のレースをスキャン中 ({today})...")
         
-        # ★修正: ループ順序を変更
-        # 以前: 会場(1-24) -> レース(1-12) ※これだと24場の1Rが終わってから1場の2R...となる
-        # 今回: レース(1-12) -> 会場(1-24) ※これなら全場の1Rを先にチェックできる
-        
+        # 1-12R順にスキャン
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             futures = []
-            for rno in range(1, 13):      # レース番号を外側のループに
-                for jcd in range(1, 25):  # 会場を内側のループに
+            for rno in range(1, 13):
+                for jcd in range(1, 25):
                     futures.append(ex.submit(process_race, jcd, rno, today))
             concurrent.futures.wait(futures)
 
