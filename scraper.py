@@ -25,49 +25,37 @@ def get_soup(session, url):
     except: return None
 
 def extract_deadline(soup, rno):
-    """
-    HTML構造解析による強力な締切時刻取得
-    """
+    """HTML構造解析による強力な締切時刻取得"""
     if not soup: return None
-    
     try:
         candidates = soup.find_all(['th', 'td'], string=re.compile(r"締切|予定"))
-        
         for tag in candidates:
             parent_row = tag.find_parent("tr")
             if not parent_row: continue
             
             cells = parent_row.find_all(['td', 'th'])
-            
-            # 全レース一覧表判定
             time_cells = []
             for cell in cells:
                 txt = clean_text(cell.text)
                 if re.search(r"\d{1,2}:\d{2}", txt):
                     time_cells.append(txt)
             
-            # 一覧表なら該当レースの時間を取得
             if len(time_cells) >= 10:
                 if 1 <= rno <= len(time_cells):
                     target_time = time_cells[rno - 1]
                     m = re.search(r"(\d{1,2}:\d{2})", target_time)
                     if m: return m.group(1).zfill(5)
 
-            # 個別表示（隣のセル）
             next_tag = tag.find_next_sibling(['td', 'th'])
             if next_tag:
                 text = clean_text(next_tag.text)
                 m = re.search(r"(\d{1,2}:\d{2})", text)
                 if m: return m.group(1).zfill(5)
             
-            # 同じセル内
             text = clean_text(tag.text)
             m = re.search(r"(\d{1,2}:\d{2})", text)
             if m: return m.group(1).zfill(5)
-
-    except Exception:
-        pass
-    
+    except Exception: pass
     return None
 
 def scrape_race_data(session, jcd, rno, date_str):
@@ -99,76 +87,87 @@ def scrape_race_data(session, jcd, rno, date_str):
     if not row['deadline_time']:
         row['deadline_time'] = extract_deadline(soup_list, rno)
 
-    # 天候・風
+    # 天候・風（提示コードのロジックを採用：.is-windDirection から取得）
     if soup_before:
         try:
-            w_node = soup_before.select_one(".weather1_bodyUnitLabelData")
-            wind_txt = w_node.text if w_node else ""
-            if not wind_txt:
-                m = re.search(r"風.*?(\d+)m", soup_before.text)
-                if m: wind_txt = m.group(1)
-            m = re.search(r"(\d+)", clean_text(wind_txt))
-            if m: row['wind'] = float(m.group(1))
+            wind_unit = soup_before.select_one(".is-windDirection")
+            if wind_unit:
+                wind_data = wind_unit.select_one(".weather1_bodyUnitLabelData")
+                if wind_data:
+                    w_txt = clean_text(wind_data.text)
+                    m = re.search(r"(\d+)", w_txt)
+                    if m: row['wind'] = float(m.group(1))
+            
+            # 取れなかった場合の予備（旧ロジック）
+            if row['wind'] == 0.0:
+                 m = re.search(r"風.*?(\d+)m", soup_before.text)
+                 if m: row['wind'] = float(m.group(1))
         except: pass
 
     # --- 各艇データ ---
     for i in range(1, 7):
-        # ★修正: 直前情報（展示タイム）の取得ロジックを強化
-        # 列番号決め打ちをやめ、行の中から「6.xx」を探す
+        # ★修正: 提示コードの展示タイム取得ロジック（tds[4:] から探す）を適用
         if soup_before:
             try:
-                cell = soup_before.select_one(f".is-boatColor{i}")
-                if cell:
-                    # その選手の行にある全セルを取得
-                    tds = cell.find_parent("tr").find_all(['td', 'th'])
-                    
-                    found_ex = False
-                    for td in tds:
-                        val = clean_text(td.text)
-                        # 展示タイムはほぼ必ず "6.xx" の形式
-                        if re.match(r"^6\.\d{2}$", val):
-                            row[f'ex{i}'] = float(val)
-                            found_ex = True
-                            break
-                    
-                    # 6.xx が見つからない場合（稀に7.00とか）、index 4, 5あたりを再確認
-                    if not found_ex and len(tds) > 5:
-                         # 従来の方法も予備として
-                         val = clean_text(tds[4].text)
-                         if re.match(r"^\d\.\d{2}$", val): row[f'ex{i}'] = float(val)
-                         
+                # is-boatColor{i} を持つtdを探す
+                boat_td = soup_before.select_one(f"td.is-boatColor{i}")
+                if boat_td:
+                    tr = boat_td.find_parent("tr")
+                    if tr:
+                        tds = tr.select("td")
+                        # 通常は4番目以降にある
+                        for td in tds[4:]:
+                            val = clean_text(td.text)
+                            # 6.00〜7.50くらいの値を探す
+                            if re.match(r"^\d\.\d{2}$", val):
+                                f_val = float(val)
+                                if 6.0 <= f_val <= 7.5:
+                                    row[f'ex{i}'] = f_val
+                                    break
             except: pass
 
         # 出走表データ（勝率・モーターなど）
         if soup_list:
             try:
-                cell = soup_list.select_one(f".is-boatColor{i}")
-                if cell:
-                    tbody = cell.find_parent("tbody")
-                    pid_node = tbody.select_one(".is-fs11")
-                    if pid_node:
-                        pm = re.search(r"(\d{4})", pid_node.text)
-                        if pm: row[f'pid{i}'] = int(pm.group(1))
-
-                    tr = cell.find_parent("tr")
-                    tds = tr.select("td")
+                # tbody.is-fs12 を順番に取得（提示コードのロジック）
+                tbodies = soup_list.select("tbody.is-fs12")
+                if len(tbodies) >= i:
+                    tbody = tbodies[i-1]
                     
-                    if len(tds) > 3:
-                        txt = clean_text(tds[3].text)
-                        f_m = re.search(r"F(\d+)", txt)
-                        if f_m: row[f'f{i}'] = int(f_m.group(1))
-                        st_m = re.search(r"(\.\d{2}|\d\.\d{2})", txt)
-                        if st_m:
-                            v = float(st_m.group(1))
-                            if v < 1.0: row[f'st{i}'] = v
-                    if len(tds) > 4:
-                        txt = clean_text(tds[4].text)
-                        wr_m = re.search(r"(\d\.\d{2})", txt)
-                        if wr_m: row[f'wr{i}'] = float(wr_m.group(1))
-                    if len(tds) > 6:
-                        txt = clean_text(tds[6].text)
-                        mo_m = re.findall(r"(\d{2,3}\.\d{2})", txt)
-                        if mo_m: row[f'mo{i}'] = float(mo_m[0])
+                    # 登番
+                    txt_all = clean_text(tbody.text)
+                    pid_match = re.search(r"([2-5]\d{3})", txt_all)
+                    if pid_match: row[f'pid{i}'] = int(pid_match.group(1))
+
+                    tds = tbody.select("td")
+                    full_row_text = " ".join([clean_text(td.text) for td in tds])
+
+                    # 勝率 (1.00-9.99)
+                    for td in tds:
+                        txt = clean_text(td.text)
+                        m = re.search(r"(\d\.\d{2})", txt)
+                        if m:
+                            val = float(m.group(1))
+                            if 1.0 <= val <= 9.99:
+                                row[f'wr{i}'] = val
+                                break
+                    
+                    # モーター (10.0-99.9)
+                    mo_matches = re.findall(r"(\d{2}\.\d{2})", full_row_text)
+                    if mo_matches:
+                        for m_val in mo_matches:
+                            if 10.0 <= float(m_val) <= 99.9:
+                                row[f'mo{i}'] = float(m_val)
+                                break
+                    
+                    # 平均ST
+                    st_match = re.search(r"(0\.\d{2})", full_row_text)
+                    if st_match: row[f'st{i}'] = float(st_match.group(1))
+
+                    # F数
+                    f_match = re.search(r"F(\d+)", full_row_text)
+                    if f_match: row[f'f{i}'] = int(f_match.group(1))
+
             except: pass
 
     return row, None
@@ -178,32 +177,30 @@ def scrape_result(session, jcd, rno, date_str):
     soup = get_soup(session, url)
     if not soup: return None
 
-    res = {
-        'sanrentan_combo': None,
-        'sanrentan_payout': 0,
-    }
-
+    res = { 'sanrentan_combo': None, 'sanrentan_payout': 0 }
     try:
-        tables = soup.select("table")
+        # table.is-w495 を探す（提示コードのロジック）
+        tables = soup.select("table.is-w495")
         for tbl in tables:
-            txt = clean_text(tbl.text)
-            if "3連単" in txt and "払戻金" in txt:
+            if "3連単" in tbl.text:
                 rows = tbl.select("tr")
                 for tr in rows:
-                    row_txt = clean_text(tr.text)
-                    combo_node = tr.select(".numberSet1_number")
-                    combo_text = ""
-                    if combo_node:
-                        nums = [c.text.strip() for c in combo_node]
-                        combo_text = "-".join(nums)
-                    pay_node = tr.select_one(".is-payout1")
-                    payout = 0
-                    if pay_node:
-                        p_txt = clean_text(pay_node.text).replace("¥","").replace(",","")
-                        if p_txt.isdigit(): payout = int(p_txt)
-                    if "3連単" in row_txt and combo_text:
-                        res['sanrentan_combo'] = combo_text
-                        res['sanrentan_payout'] = payout
+                    if "3連単" in tr.text:
+                        # 組み番
+                        combo_node = tr.select(".numberSet1_number")
+                        if combo_node:
+                            nums = [c.text.strip() for c in combo_node]
+                            res['sanrentan_combo'] = "-".join(nums)
+                        
+                        # 払い戻し（後ろから探す）
+                        tds = tr.select("td")
+                        for td in reversed(tds):
+                            txt = clean_text(td.text).replace("¥","").replace(",","")
+                            if txt.isdigit():
+                                val = int(txt)
+                                if val >= 100: # 100円以上なら金額とみなす
+                                    res['sanrentan_payout'] = val
+                                    break
     except Exception: pass
     if not res['sanrentan_combo']: return None
     return res
