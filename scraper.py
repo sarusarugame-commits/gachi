@@ -19,7 +19,8 @@ def get_soup(session, url):
     try:
         res = session.get(url, timeout=10)
         if res.status_code != 200: return None
-        if len(res.content) < 3000: return None 
+        # データ量チェック
+        if len(res.content) < 1000: return None 
         if "データがありません" in res.text: return None
         return BeautifulSoup(res.content, 'lxml')
     except: return None
@@ -82,12 +83,10 @@ def scrape_race_data(session, jcd, rno, date_str):
         'pid6':0, 'wr6':0.0, 'mo6':0.0, 'ex6':0.0, 'f6':0, 'st6':0.20,
     }
 
-    # 締切時刻
     row['deadline_time'] = extract_deadline(soup_before, rno)
     if not row['deadline_time']:
         row['deadline_time'] = extract_deadline(soup_list, rno)
 
-    # 天候・風
     if soup_before:
         try:
             wind_unit = soup_before.select_one(".is-windDirection")
@@ -103,9 +102,8 @@ def scrape_race_data(session, jcd, rno, date_str):
                  if m: row['wind'] = float(m.group(1))
         except: pass
 
-    # --- 各艇データ ---
     for i in range(1, 7):
-        # ★重要: 展示タイムは直前情報からのみ取得（出走表の勝率と混同しない）
+        # 展示タイムは直前情報からのみ
         if soup_before:
             try:
                 boat_td = soup_before.select_one(f"td.is-boatColor{i}")
@@ -113,13 +111,11 @@ def scrape_race_data(session, jcd, rno, date_str):
                     tr = boat_td.find_parent("tr")
                     if tr:
                         text_all = clean_text(tr.text)
-                        # 6.xx または 7.00~7.49 あたりを展示タイムとみなす
                         matches = re.findall(r"(6\.\d{2}|7\.[0-4]\d)", text_all)
                         if matches:
                             row[f'ex{i}'] = float(matches[-1])
             except: pass
 
-        # 出走表データ（勝率・モーターなど）
         if soup_list:
             try:
                 tbodies = soup_list.select("tbody.is-fs12")
@@ -131,8 +127,7 @@ def scrape_race_data(session, jcd, rno, date_str):
                     if pid_match: row[f'pid{i}'] = int(pid_match.group(1))
 
                     full_row_text = txt_all 
-
-                    # 勝率
+                    
                     wr_matches = re.findall(r"(\d\.\d{2})", full_row_text)
                     for val_str in wr_matches:
                         val = float(val_str)
@@ -140,18 +135,15 @@ def scrape_race_data(session, jcd, rno, date_str):
                             row[f'wr{i}'] = val
                             break
                     
-                    # モーター
                     mo_matches = re.findall(r"(\d{2}\.\d{2})", full_row_text)
                     for m_val in mo_matches:
                         if 10.0 <= float(m_val) <= 99.9:
                             row[f'mo{i}'] = float(m_val)
                             break
                     
-                    # 平均ST
                     st_match = re.search(r"(0\.\d{2})", full_row_text)
                     if st_match: row[f'st{i}'] = float(st_match.group(1))
 
-                    # F数
                     f_match = re.search(r"F(\d+)", full_row_text)
                     if f_match: row[f'f{i}'] = int(f_match.group(1))
 
@@ -160,23 +152,81 @@ def scrape_race_data(session, jcd, rno, date_str):
     return row, None
 
 def get_exact_odds(session, jcd, rno, date_str, combo):
-    """指定された買い目（例: '1-2-3'）の現在のオッズを取得する"""
+    """
+    指定された買い目のオッズを取得する
+    HTMLの rowspan 構造（18列/12列の混在）に対応
+    """
     url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup = get_soup(session, url)
     if not soup: return None
 
     try:
-        # 買い目を含むtdを探す
-        target_td = soup.find(lambda tag: tag.name == "td" and combo in clean_text(tag.text))
-        if target_td:
-            odds_td = target_td.find_next_sibling("td")
-            if odds_td:
-                odds_txt = clean_text(odds_td.text)
-                m = re.search(r"(\d{1,3}\.\d)", odds_txt)
-                if m:
-                    return float(m.group(1))
+        try:
+            target_b1, target_b2, target_b3 = map(int, combo.split('-'))
+        except: return None
+
+        # 1. 該当するテーブルを探す (クラス名が変わる可能性があるので、構造で探す)
+        # 「div.table1」の中にある「table tbody」を狙う
+        tbodies = soup.select("div.table1 table tbody")
+        if not tbodies: return None
+        
+        # 基本的に最初のtbodyが対象
+        rows = tbodies[0].select("tr")
+
+        # 各1着艇（1〜6号艇）の「現在の2着艇」を記憶する配列
+        # なぜなら、rowspanで結合されている行では2着艇のセルが存在しないため
+        current_2nd_boats = [0] * 7 # 1-6を使う
+
+        for tr in rows:
+            tds = tr.select("td")
+            col_count = len(tds)
+
+            # --- パターンA: 2着艇の記載がある行（全18列）---
+            # 各ブロック: [2着艇, 3着艇, オッズ]
+            if col_count == 18:
+                # ターゲットの1着艇ブロックがどこにあるか計算
+                # 1号艇頭=0~2列目, 2号艇頭=3~5列目 ...
+                block_index = (target_b1 - 1) * 3
+                
+                # 全ブロックの2着艇を更新（次の行以降のために記憶）
+                for b_idx in range(6):
+                    try:
+                        b_val = int(clean_text(tds[b_idx * 3].text))
+                        current_2nd_boats[b_idx + 1] = b_val
+                    except: pass
+                
+                # ターゲット確認
+                try:
+                    b2_cell = clean_text(tds[block_index].text)
+                    b3_cell = clean_text(tds[block_index + 1].text)
+                    odds_cell = clean_text(tds[block_index + 2].text)
+                    
+                    if int(b2_cell) == target_b2 and int(b3_cell) == target_b3:
+                        return float(odds_cell)
+                except: pass
+
+            # --- パターンB: 2着艇が結合されていて無い行（全12列）---
+            # 各ブロック: [3着艇, オッズ] （2着艇は current_2nd_boats を使う）
+            elif col_count == 12:
+                # ターゲットの1着艇ブロック位置
+                # 1号艇頭=0~1列目, 2号艇頭=2~3列目 ...
+                block_index = (target_b1 - 1) * 2
+                
+                # 記憶している2着艇がターゲットと一致するか？
+                if current_2nd_boats[target_b1] == target_b2:
+                    try:
+                        b3_cell = clean_text(tds[block_index].text)
+                        odds_cell = clean_text(tds[block_index + 1].text)
+                        
+                        if int(b3_cell) == target_b3:
+                            return float(odds_cell)
+                    except: pass
+            
+            # それ以外の行（ヘッダーやイレギュラー）は無視
+
     except Exception:
         pass
+        
     return None
 
 def scrape_result(session, jcd, rno, date_str):
