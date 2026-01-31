@@ -35,7 +35,10 @@ def get_groq_client():
 
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
-STRATEGY_DEFAULT = {'th': 0.040, 'k': 5}
+
+# ★閾値設定を 0.050 (5%) に変更
+# これにより、AIが「5%以上の確率で来る」と断言したもの以外はすべて切り捨てる
+STRATEGY_DEFAULT = {'th': 0.050, 'k': 5}
 STRATEGY = {}
 
 def load_model():
@@ -55,17 +58,13 @@ def load_model():
 def generate_batch_reasons(jcd, bets_info, raw_data):
     """
     複数の買い目をまとめてAIに分析させ、個別のコメントを取得する
-    bets_info: [{'combo': '1-2-3', 'prob': 4.5, 'odds': 8.8, 'ev': 0.39}, ...]
     """
     client = get_groq_client()
-    # クライアントが無い、またはオッズ情報が空なら簡易コメント
-    if not client:
-        return {}
+    if not client: return {}
 
     models = ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile"]
     selected_model = random.choice(models)
 
-    # 選手情報作成
     players_info = ""
     for i in range(1, 7):
         s = str(i)
@@ -73,7 +72,6 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
         mo = raw_data.get(f'mo{s}', 0.0)
         players_info += f"{i}号艇:勝率{wr:.2f}/機力{mo:.1f} "
     
-    # 買い目リストのテキスト化
     bets_text = ""
     for b in bets_info:
         odds_str = f"{b['odds']}倍" if b['odds'] else "不明"
@@ -94,8 +92,8 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
     各買い目に対して、オッズと確率のバランス（期待値）を見た上で、「投資すべきか」「危険か」「妙味ありか」など、
     一言ずつ（20文字以内）で鋭いコメントを付けてください。
     
-    出力形式は以下のように、買い目とコメントをコロンで区切って1行ずつ書いてください。余計な前置きは不要です。
-    
+    出力形式は買い目とコメントをコロン区切りで1行ずつ。
+    例:
     1-2-3: 本命だが配当安すぎ、見送り推奨。
     1-2-4: このオッズなら狙う価値あり。
     """
@@ -111,22 +109,16 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
             temperature=0.7,
             max_tokens=300,
         )
-        
         response_text = chat_completion.choices[0].message.content.strip()
         
-        # 応答をパースして辞書にする
         comments = {}
         for line in response_text.split('\n'):
             if ':' in line:
                 parts = line.split(':', 1)
-                combo_key = parts[0].strip().replace("-", "").replace(" ", "") # 123形式で正規化トライ
-                combo_raw = parts[0].strip() # 1-2-3形式
+                combo_raw = parts[0].strip()
                 comment = parts[1].strip()
-                
                 comments[combo_raw] = comment
-                
         return comments
-
     except Exception as e:
         print(f"❌ Groq API Error: {e}")
         return {}
@@ -137,7 +129,6 @@ def attach_reason(results, raw, odds_map=None):
     
     jcd = raw.get('jcd', 0)
     
-    # 1. 分析用データの準備
     bets_to_analyze = []
     for item in results:
         combo = item['combo']
@@ -147,52 +138,37 @@ def attach_reason(results, raw, odds_map=None):
         ev = None
         if odds:
             ev = (prob / 100) * odds
-            item['odds'] = odds # 結果に保存
-            item['ev'] = ev     # 結果に保存
+            item['odds'] = odds
+            item['ev'] = ev
         
-        bets_to_analyze.append({
-            'combo': combo,
-            'prob': prob,
-            'odds': odds,
-            'ev': ev
-        })
+        bets_to_analyze.append({'combo': combo, 'prob': prob, 'odds': odds, 'ev': ev})
 
-    # 2. AIに一括分析させる
     ai_comments = generate_batch_reasons(jcd, bets_to_analyze, raw)
     
-    # 3. 結果に割り当て
     for item in results:
         combo = item['combo']
         ev_val = item.get('ev')
-        
-        # AIコメントがあればそれを使う
-        # AIがフォーマット通り返さない場合もあるので、キーの一致を柔軟に
         ai_comment = ai_comments.get(combo)
-        
-        # 期待値表示の作成
         ev_str = f"(EV:{ev_val:.2f})" if ev_val else ""
         
         if ai_comment:
             item['reason'] = f"{ai_comment} {ev_str}"
         else:
-            # AIコメント取得失敗時のバックアップ（ルールベース）
             if ev_val:
-                if ev_val >= 1.5:
-                    item['reason'] = f"🔥超抜期待値！迷わず買い。 {ev_str}"
-                elif ev_val >= 1.0:
-                    item['reason'] = f"配当妙味あり。 {ev_str}"
-                elif ev_val >= 0.8:
-                    item['reason'] = f"抑えとしては妥当。 {ev_str}"
-                else:
-                    item['reason'] = f"オッズ辛いが的中率でカバー。 {ev_str}"
+                if ev_val >= 1.5: item['reason'] = f"🔥超抜期待値！ {ev_str}"
+                elif ev_val >= 1.0: item['reason'] = f"配当妙味あり。 {ev_str}"
+                elif ev_val >= 0.8: item['reason'] = f"抑え妥当。 {ev_str}"
+                else: item['reason'] = f"オッズ辛い。 {ev_str}"
             else:
-                item['reason'] = "オッズ不明のため判断保留"
+                item['reason'] = "オッズ不明"
 
 def predict_race(raw, odds_data=None):
     model = load_model()
     jcd = raw.get('jcd', 0)
     wind = raw.get('wind', 0.0)
     rno = raw.get('rno', 0)
+    
+    # 厳選設定: 閾値 5.0%
     strat = STRATEGY.get(jcd, STRATEGY_DEFAULT)
     
     ex_values = [raw.get(f'ex{i}', 0) for i in range(1, 7)]
@@ -233,20 +209,26 @@ def predict_race(raw, odds_data=None):
     
     best_bet = combos[0]
 
-    if best_bet['score'] < strat['th']:
-        if best_bet['score'] > 0.035:
-             print(f"📉 {jcd}場{rno}R: スコア不足 (Best: {best_bet['score']*100:.2f}%) -> {best_bet['combo']}")
+    # ★ 1番自信のある買い目ですら 5.0% (0.05) 未満なら、レースごと見送り
+    # これで「自信のないレース」には一切手を出さなくなります
+    if best_bet['score'] < 0.05:
+        # print(f"📉 スコア不足: {best_bet['score']*100:.1f}% < 5%")
         return []
 
     results = []
     for rank, item in enumerate(combos[:strat['k']]):
+        # ★ 個別の買い目も 5.0% 未満ならカット
+        if item['score'] < 0.05:
+            continue
+            
         results.append({
             'combo': item['combo'],
             'type': f"ランク{rank+1}",
             'profit': "計算中",
             'prob': f"{item['score']*100:.1f}",
             'roi': 0,
-            'reason': "分析中...", # 初期値
+            'reason': "待機中...",
             'deadline': raw.get('deadline_time', '不明')
         })
+        
     return results
