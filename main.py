@@ -8,6 +8,7 @@ import sys
 import requests as std_requests
 import json
 
+# ★ get_odds_map に変更
 from scraper import scrape_race_data, get_session, get_odds_map
 from predict_boat import predict_race, attach_reason, load_model
 
@@ -18,13 +19,10 @@ JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 sys.stdout.reconfigure(encoding='utf-8')
 
 DB_LOCK = threading.Lock()
-STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0, "vetted": 0}
+STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0}
 STATS_LOCK = threading.Lock()
 FINISHED_RACES = set()
 FINISHED_RACES_LOCK = threading.Lock()
-
-# 期待値フィルター (1.0以上で購入)
-EV_THRESHOLD = 1.0
 
 def log(msg):
     print(f"[{datetime.datetime.now(JST).strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -41,22 +39,7 @@ def send_discord(content):
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    # ★テーブル構造を変更: オッズ、確率、期待値、コメントを追加
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            race_id TEXT PRIMARY KEY,
-            date TEXT,
-            place TEXT,
-            race_no INTEGER,
-            predict_combo TEXT,
-            status TEXT,
-            profit INTEGER,
-            odds REAL,
-            prob REAL,
-            ev REAL,
-            comment TEXT
-        )
-    """)
+    conn.execute("CREATE TABLE IF NOT EXISTS history (race_id TEXT PRIMARY KEY, date TEXT, place TEXT, race_no INTEGER, predict_combo TEXT, status TEXT, profit INTEGER)")
     conn.close()
 
 def report_worker(stop_event):
@@ -94,23 +77,24 @@ def report_worker(stop_event):
                         total_profit = conn.execute("SELECT SUM(profit) FROM history WHERE date=? AND status='FINISHED'", (today_str,)).fetchone()[0]
                         if total_profit is None: total_profit = 0
 
-                        # 追加情報を取得（オッズやコメント）
-                        odds_val = p['odds'] if p['odds'] else 0.0
-                        comment_str = p['comment'] if p['comment'] else "なし"
-
                         if result_str == combo:
                             msg = (
                                 f"🎯 **{p['place']}{p['race_no']}R** 的中！\n"
-                                f"買い目: {combo} ({odds_val}倍)\n"
-                                f"払戻: {payout:,}円 (収支: +{profit:,}円)\n"
-                                f"💡 AIの読み: {comment_str}\n"
+                                f"買い目: {combo}\n"
+                                f"払戻: {payout:,}円\n"
+                                f"収支: +{profit:,}円\n"
                                 f"📅 **本日トータル: {total_profit:+,}円**"
                             )
                             log(f"🎯 的中: {p['place']}{p['race_no']}R ({combo}) +{profit}円")
                             send_discord(msg)
                         else:
-                            # 負けた場合はログのみ（または静かに）
-                            pass
+                            msg = (
+                                f"💀 **{p['place']}{p['race_no']}R** ハズレ\n"
+                                f"予想: {combo} (結果: {result_str})\n"
+                                f"📅 **本日トータル: {total_profit:+,}円**"
+                            )
+                            log(f"💀 ハズレ: {p['place']}{p['race_no']}R (結果:{result_str})")
+                            send_discord(msg)
                 conn.close()
         except Exception as e:
             pass
@@ -176,45 +160,37 @@ def process_race(jcd, rno, today):
     
     if not new_preds: return
 
+    log(f"⚡ {place}{rno}R で {len(new_preds)}件の候補を検知！オッズ取得＆AI解説生成中...")
+    
+    # ★修正箇所：全オッズを一括取得する
     odds_map = {}
     try:
         odds_map = get_odds_map(sess, jcd, rno, today)
-    except Exception: pass
+        if odds_map:
+            log(f"💰 {place}{rno}R: オッズ取得成功 ({len(odds_map)}件)")
+    except Exception as e:
+        log(f"⚠️ オッズ取得失敗: {e}")
 
     try:
-        attach_reason(new_preds, raw, odds_map)
-    except Exception: pass
-
-    filtered_preds = []
-    for p in new_preds:
-        ev = p.get('ev', 0)
-        
-        # 期待値フィルター
-        if ev < EV_THRESHOLD:
-            with STATS_LOCK: STATS["vetted"] += 1
-            continue
-            
-        filtered_preds.append(p)
-        
-    if not filtered_preds: return
-
-    log(f"⚡ {place}{rno}R: 厳選 {len(filtered_preds)}件 を登録")
+        # マップごと渡す
+        attach_reason(preds, raw, odds_map)
+    except Exception as e:
+        log(f"⚠️ 解説エラー: {e}")
 
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE)
-        for p in filtered_preds:
+        for p in new_preds:
             combo = p['combo']
             race_id = f"{today}_{jcd}_{rno}_{combo}"
             if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone(): continue
 
-            prob = float(p.get('prob', 0))
+            prob = p['prob']
             reason = p.get('reason', '解説取得失敗')
             deadline = p.get('deadline', '不明')
-            odds_val = p.get('odds', 0.0)
-            ev_val = p.get('ev', 0.0)
+            odds_val = p.get('odds')
             
-            odds_log = f"({odds_val}倍 EV:{ev_val:.2f})" if odds_val else ""
-            log(f"🔥 [HIT] {place}{rno}R -> {combo} {odds_log}")
+            odds_log = f"({odds_val}倍)" if odds_val else ""
+            log(f"🔥 [HIT] {place}{rno}R -> {combo} (確率:{prob}%) {odds_log}")
             
             odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
 
@@ -222,25 +198,20 @@ def process_race(jcd, rno, today):
                 f"🔥 **{place}{rno}R** 激アツ予想\n"
                 f"⏰ 締切: **{deadline}**\n"
                 f"🎯 買い目: **{combo}**\n"
-                f"📊 確率: **{prob}%** / オッズ: **{odds_val}倍**\n"
-                f"💎 期待値: **{ev_val:.2f}**\n"
-                f"📝 AI寸評: {reason}\n"
+                f"📊 当選確率: **{prob}%**\n"
+                f"💰 現在オッズ: **{odds_val if odds_val else '不明'}倍**\n"
+                f"📝 解説: {reason}\n"
                 f"🔗 [オッズ確認]({odds_url})"
             )
             
-            # ★拡張されたカラムへINSERT
-            conn.execute(
-                "INSERT INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (race_id, today, place, rno, combo, 'PENDING', 0, odds_val, prob, ev_val, reason)
-            )
+            conn.execute("INSERT INTO history VALUES (?,?,?,?,?,?,?)", (race_id, today, place, rno, combo, 'PENDING', 0))
             conn.commit()
             send_discord(msg)
             with STATS_LOCK: STATS["hits"] += 1
         conn.close()
 
 def main():
-    log(f"🚀 最強AI Bot (投資モード v5.1) 起動 - 完全データ保存版")
-    log(f"🛡️ 期待値フィルター: EV >= {EV_THRESHOLD} のみ購入")
+    log("🚀 最強AI Bot (本番運用モード v4.1) 起動 - オッズ被り修正版")
     
     try:
         load_model()
@@ -274,7 +245,6 @@ def main():
             STATS["hits"] = 0
             STATS["errors"] = 0
             STATS["skipped"] = 0
-            STATS["vetted"] = 0
 
         log(f"🔍 直近のレースをスキャン中 ({today})...")
         
@@ -285,7 +255,7 @@ def main():
                     futures.append(ex.submit(process_race, jcd, rno, today))
             concurrent.futures.wait(futures)
 
-        log(f"🏁 スキャン完了: 候補={STATS['scanned']}, 見送り(EV不足)={STATS['vetted']}, HIT={STATS['hits']}")
+        log(f"🏁 スキャン完了: 有効チェック={STATS['scanned']}, 範囲外スキップ={STATS['skipped']}, HIT={STATS['hits']}")
         log("💤 待機中(300秒)...")
         time.sleep(300)
 
