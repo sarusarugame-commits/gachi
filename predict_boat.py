@@ -58,7 +58,6 @@ def load_model():
                 z.extractall(".")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
         else:
-            # ★ ここでエラーを発生させる（カレントディレクトリのファイル一覧を表示）
             cwd_files = os.listdir(".")
             raise FileNotFoundError(f"モデルファイル '{MODEL_FILE}' が見つかりません。現在のディレクトリ: {os.getcwd()}, ファイル一覧: {cwd_files}")
             
@@ -72,11 +71,9 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     if not client:
         return f"基準クリア（自信度{prob}%）"
 
-    # モデルランダム選択
     models = ["llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile"]
     selected_model = random.choice(models)
 
-    # 選手データの要約
     players_info = ""
     for i in range(1, 7):
         s = str(i)
@@ -98,7 +95,6 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
 
     try:
-        # 短い待機
         time.sleep(random.uniform(0.5, 1.5))
         
         chat_completion = client.chat.completions.create(
@@ -136,14 +132,22 @@ def attach_reason(results, raw):
             item['reason'] = "同上（抑え）"
 
 def predict_race(raw, odds_data=None):
-    # エラー時は例外をそのまま上に投げる
     model = load_model()
     
     jcd = raw.get('jcd', 0)
     wind = raw.get('wind', 0.0)
-    if jcd not in STRATEGY: return []
+    rno = raw.get('rno', 0)
     
-    if sum([raw.get(f'ex{i}', 0) for i in range(1, 7)]) == 0: return []
+    if jcd not in STRATEGY:
+        return []
+    
+    # ★診断ログ1: 展示タイムのチェック
+    ex_values = [raw.get(f'ex{i}', 0) for i in range(1, 7)]
+    if sum(ex_values) == 0:
+        # 展示タイムが入っていないと予想できないためスキップ
+        # 開催前や、中止、あるいはスクレイピング失敗の可能性
+        print(f"⚠️ {jcd}場{rno}R: 展示タイムなし -> スキップ (Ex: {ex_values})")
+        return []
 
     rows = []
     for i in range(1, 7):
@@ -174,7 +178,9 @@ def predict_race(raw, odds_data=None):
         preds = model.predict(df_race[features])
         if preds.shape[1] < 3: return []
         p1, p2, p3 = preds[:, 0], preds[:, 1], preds[:, 2]
-    except: return []
+    except Exception as e:
+        print(f"❌ {jcd}場{rno}R: 予測エラー {e}")
+        return []
 
     b = df_race['boat_no'].values
     combos = []
@@ -189,19 +195,25 @@ def predict_race(raw, odds_data=None):
     strat = STRATEGY[jcd]
     best_bet = combos[0]
 
-    if best_bet['score'] >= strat['th']:
-        results = []
-        for rank, item in enumerate(combos[:strat['k']]):
-            prob_percent = item['score'] * 100
-            results.append({
-                'combo': item['combo'],
-                'type': f"ランク{rank+1}",
-                'profit': "計算中",
-                'prob': f"{prob_percent:.1f}",
-                'roi': 0,
-                'reason': "待機中...",
-                'deadline': raw.get('deadline_time', '不明')
-            })
-        return results
+    # ★診断ログ2: スコアのチェック
+    # 最も高かったスコアが閾値を超えているか確認
+    if best_bet['score'] < strat['th']:
+        # 惜しい場合はログに出す（閾値の半分以上なら表示）
+        if best_bet['score'] > (strat['th'] * 0.5):
+            print(f"📉 {jcd}場{rno}R: スコア不足 (Best: {best_bet['score']*100:.2f}% / 必要: {strat['th']*100:.1f}%) -> {best_bet['combo']}")
+        return []
 
-    return []
+    # 合格した場合
+    results = []
+    for rank, item in enumerate(combos[:strat['k']]):
+        prob_percent = item['score'] * 100
+        results.append({
+            'combo': item['combo'],
+            'type': f"ランク{rank+1}",
+            'profit': "計算中",
+            'prob': f"{prob_percent:.1f}",
+            'roi': 0,
+            'reason': "待機中...",
+            'deadline': raw.get('deadline_time', '不明')
+        })
+    return results
