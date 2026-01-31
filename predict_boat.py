@@ -8,13 +8,14 @@ import random
 from itertools import permutations
 import json
 
-# ★ GROQクライアントの準備
+# ★ GROQクライアントの準備（エラーログ強化版）
 GROQ_AVAILABLE = False
 try:
     from groq import Groq
     GROQ_AVAILABLE = True
 except ImportError:
     GROQ_AVAILABLE = False
+    print("⚠️ 'groq' ライブラリが見つかりません。pip install groq を実行してください。")
 
 _GROQ_CLIENT = None
 
@@ -25,25 +26,26 @@ def get_groq_client():
     
     if _GROQ_CLIENT is None:
         api_key = os.environ.get("GROQ_API_KEY")
-        if api_key:
-            try:
-                _GROQ_CLIENT = Groq(api_key=api_key, max_retries=0, timeout=10.0)
-            except Exception as e:
-                print(f"Groq Init Error: {e}")
-                return None
+        if not api_key:
+            print("⚠️ 環境変数 'GROQ_API_KEY' が設定されていません。")
+            return None
+            
+        try:
+            _GROQ_CLIENT = Groq(api_key=api_key, max_retries=0, timeout=10.0)
+        except Exception as e:
+            print(f"❌ Groqクライアント初期化エラー: {e}")
+            return None
     return _GROQ_CLIENT
 
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
 
+# ★【厳選設定】1日2〜3レースを狙うため、閾値を 0.040 (4.0%) に設定
+# 点数(k)は5点のまま維持（的中率確保のため）
+STRATEGY_DEFAULT = {'th': 0.040, 'k': 5}
 STRATEGY = {
-    1:  {'th': 0.065, 'k': 1}, 2:  {'th': 0.050, 'k': 5}, 3:  {'th': 0.060, 'k': 8},
-    4:  {'th': 0.050, 'k': 5}, 5:  {'th': 0.040, 'k': 1}, 7:  {'th': 0.065, 'k': 1},
-    8:  {'th': 0.070, 'k': 5}, 9:  {'th': 0.055, 'k': 1}, 10: {'th': 0.060, 'k': 8},
-    11: {'th': 0.045, 'k': 1}, 12: {'th': 0.060, 'k': 1}, 13: {'th': 0.040, 'k': 1},
-    15: {'th': 0.065, 'k': 1}, 16: {'th': 0.055, 'k': 1}, 18: {'th': 0.070, 'k': 1},
-    19: {'th': 0.065, 'k': 1}, 20: {'th': 0.070, 'k': 8}, 21: {'th': 0.060, 'k': 1},
-    22: {'th': 0.055, 'k': 1},
+    # 特定の場だけ調整したい場合はここに記述
+    # 例: 1: {'th': 0.045, 'k': 5}, 
 }
 
 def load_model():
@@ -59,7 +61,7 @@ def load_model():
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
         else:
             cwd_files = os.listdir(".")
-            raise FileNotFoundError(f"モデルファイル '{MODEL_FILE}' が見つかりません。現在のディレクトリ: {os.getcwd()}, ファイル一覧: {cwd_files}")
+            raise FileNotFoundError(f"モデルファイル '{MODEL_FILE}' が見つかりません。")
             
     return AI_MODEL
 
@@ -109,8 +111,8 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
         return chat_completion.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"Groq Skip ({selected_model}): {e}")
-        return f"AI推奨（自信度{prob}%）※解説生成スキップ"
+        print(f"⚠️ Groq API呼び出しエラー ({selected_model}): {e}")
+        return f"AI推奨（自信度{prob}%）※解説生成失敗"
 
 def attach_reason(results, raw):
     if not results: return
@@ -138,14 +140,11 @@ def predict_race(raw, odds_data=None):
     wind = raw.get('wind', 0.0)
     rno = raw.get('rno', 0)
     
-    if jcd not in STRATEGY:
-        return []
+    # デフォルト設定を使用
+    strat = STRATEGY.get(jcd, STRATEGY_DEFAULT)
     
-    # ★診断ログ1: 展示タイムのチェック
     ex_values = [raw.get(f'ex{i}', 0) for i in range(1, 7)]
     if sum(ex_values) == 0:
-        # 展示タイムが入っていないと予想できないためスキップ
-        # 開催前や、中止、あるいはスクレイピング失敗の可能性
         print(f"⚠️ {jcd}場{rno}R: 展示タイムなし -> スキップ (Ex: {ex_values})")
         return []
 
@@ -192,18 +191,16 @@ def predict_race(raw, odds_data=None):
         })
     combos.sort(key=lambda x: x['score'], reverse=True)
     
-    strat = STRATEGY[jcd]
     best_bet = combos[0]
 
-    # ★診断ログ2: スコアのチェック
-    # 最も高かったスコアが閾値を超えているか確認
+    # 閾値チェック (ログ出力付き)
     if best_bet['score'] < strat['th']:
-        # 惜しい場合はログに出す（閾値の半分以上なら表示）
-        if best_bet['score'] > (strat['th'] * 0.5):
-            print(f"📉 {jcd}場{rno}R: スコア不足 (Best: {best_bet['score']*100:.2f}% / 必要: {strat['th']*100:.1f}%) -> {best_bet['combo']}")
+        # 3.5%以上なら「惜しい」ログを出す
+        if best_bet['score'] > 0.035:
+             print(f"📉 {jcd}場{rno}R: スコア不足 (Best: {best_bet['score']*100:.2f}% / 必要: {strat['th']*100:.1f}%) -> {best_bet['combo']}")
         return []
 
-    # 合格した場合
+    # 合格
     results = []
     for rank, item in enumerate(combos[:strat['k']]):
         prob_percent = item['score'] * 100
