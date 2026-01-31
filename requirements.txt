@@ -7,3 +7,4 @@ lxml
 curl_cffi
 requests
 groq
+openai
