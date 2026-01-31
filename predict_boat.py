@@ -8,43 +8,39 @@ import random
 from itertools import permutations
 import json
 
-# ★ GROQ SDKの準備
-GROQ_AVAILABLE = False
+# ★ OpenAIクライアントを使用してGroqに接続
+# (ご提示いただいた https://api.groq.com/openai/v1 を使用)
+OPENAI_AVAILABLE = False
 try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
 except ImportError:
-    print("⚠️ 'groq' ライブラリが見つかりません。")
+    print("⚠️ 'openai' ライブラリが見つかりません。pip install openai を実行してください。")
 
 _GROQ_CLIENT = None
 
 def get_groq_client():
     global _GROQ_CLIENT
-    if not GROQ_AVAILABLE:
-        return None
+    if not OPENAI_AVAILABLE: return None
     
     if _GROQ_CLIENT is None:
         api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            return None
-            
+        if not api_key: return None
         try:
-            # ★ SDK標準のリトライ機能を使用 (max_retries=5)
-            # Connection error や 429 Too Many Requests に対して自動で指数バックオフを行う
-            _GROQ_CLIENT = Groq(
-                api_key=api_key, 
-                max_retries=5, 
+            # ★ OpenAI互換クライアントで初期化
+            _GROQ_CLIENT = OpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=api_key,
+                max_retries=3, 
                 timeout=20.0
             )
-        except Exception as e:
-            print(f"❌ Groq Init Error: {e}")
-            return None
+        except: return None
     return _GROQ_CLIENT
 
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
 
-# ★【厳選設定】1日2〜3レース狙い (閾値 4.0%)
+# 厳選設定: 閾値 4.0%
 STRATEGY_DEFAULT = {'th': 0.040, 'k': 5}
 STRATEGY = {}
 
@@ -55,7 +51,6 @@ def load_model():
             print(f"📂 モデルファイルを検出: {MODEL_FILE}")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
         elif os.path.exists(MODEL_FILE.replace(".txt", ".zip")):
-            print(f"📦 ZIPモデルを解凍中: {MODEL_FILE.replace('.txt', '.zip')}")
             with zipfile.ZipFile(MODEL_FILE.replace(".txt", ".zip"), 'r') as z:
                 z.extractall(".")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
@@ -65,13 +60,17 @@ def load_model():
 
 def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
-    Groq API を使って解説を生成 (SDK標準機能版)
+    OpenAI互換クライアントでGroq APIを叩く（モデル交互利用）
     """
     client = get_groq_client()
     if not client:
-        return f"基準クリア（自信度{prob}%）"
+        return f"AI推奨（自信度{prob}%）"
 
-    models = ["llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile"]
+    # ★ ご要望通り、スカウトと70Bをランダム（交互）に使用するロジックを維持
+    models = [
+        "meta-llama/llama-4-scout-17b-16e-instruct", 
+        "llama-3.3-70b-versatile"
+    ]
     selected_model = random.choice(models)
 
     players_info = ""
@@ -85,7 +84,7 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
 
     prompt = f"""
     あなたはボートレースのプロ予想家です。
-    以下のデータに基づき、買い目「{combo}」を推奨する理由を50文字以内で簡潔に述べよ。
+    以下のデータに基づき、買い目「{combo}」を推奨する理由を、専門用語を交えて40文字以内で熱く語ってください。
     
     [データ]
     会場: {jcd}場, 風速: {raw_data.get('wind', 0)}m
@@ -95,7 +94,9 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
     """
 
     try:
-        # SDKのリトライ機能に任せてシンプルに呼び出す
+        # レート制限対策の短い待機
+        time.sleep(2.0)
+        
         chat_completion = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": "あなたは的確なボートレース分析官です。"},
@@ -108,9 +109,9 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
         return chat_completion.choices[0].message.content.strip()
 
     except Exception as e:
-        # SDKがリトライしてもダメだった場合の最終エラー
-        print(f"⚠️ Groq API Failed ({selected_model}): {e}")
-        return f"AI推奨（自信度{prob}%）"
+        # エラー時はバックアップ機能を使わず、エラー内容をログに出す
+        print(f"❌ Groq API Error ({selected_model}): {e}")
+        return f"解説取得エラー"
 
 def attach_reason(results, raw):
     if not results: return
@@ -142,7 +143,6 @@ def predict_race(raw, odds_data=None):
     
     ex_values = [raw.get(f'ex{i}', 0) for i in range(1, 7)]
     if sum(ex_values) == 0:
-        # print(f"⚠️ {jcd}場{rno}R: 展示タイムなし -> スキップ")
         return []
 
     rows = []
@@ -190,10 +190,9 @@ def predict_race(raw, odds_data=None):
     
     best_bet = combos[0]
 
-    # 閾値チェック (ログ出力)
     if best_bet['score'] < strat['th']:
         if best_bet['score'] > 0.035:
-             print(f"📉 {jcd}場{rno}R: スコア不足 (Best: {best_bet['score']*100:.2f}% / 必要: {strat['th']*100:.1f}%) -> {best_bet['combo']}")
+             print(f"📉 {jcd}場{rno}R: スコア不足 (Best: {best_bet['score']*100:.2f}%) -> {best_bet['combo']}")
         return []
 
     results = []
