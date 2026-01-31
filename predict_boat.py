@@ -8,14 +8,13 @@ import random
 from itertools import permutations
 import json
 
-# ★ OpenAIクライアントを使用してGroqに接続
-# (ご提示いただいた https://api.groq.com/openai/v1 を使用)
+# ★ OpenAIライブラリ必須
 OPENAI_AVAILABLE = False
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
 except ImportError:
-    print("⚠️ 'openai' ライブラリが見つかりません。pip install openai を実行してください。")
+    pass
 
 _GROQ_CLIENT = None
 
@@ -27,7 +26,7 @@ def get_groq_client():
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key: return None
         try:
-            # ★ OpenAI互換クライアントで初期化
+            # Groqのエンドポイントを指定して初期化
             _GROQ_CLIENT = OpenAI(
                 base_url="https://api.groq.com/openai/v1",
                 api_key=api_key,
@@ -40,7 +39,7 @@ def get_groq_client():
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
 
-# 厳選設定: 閾値 4.0%
+# ★厳選設定: 閾値 4.0%
 STRATEGY_DEFAULT = {'th': 0.040, 'k': 5}
 STRATEGY = {}
 
@@ -51,6 +50,7 @@ def load_model():
             print(f"📂 モデルファイルを検出: {MODEL_FILE}")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
         elif os.path.exists(MODEL_FILE.replace(".txt", ".zip")):
+            print(f"📦 ZIPモデルを解凍中: {MODEL_FILE.replace('.txt', '.zip')}")
             with zipfile.ZipFile(MODEL_FILE.replace(".txt", ".zip"), 'r') as z:
                 z.extractall(".")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
@@ -58,19 +58,15 @@ def load_model():
             raise FileNotFoundError(f"モデルファイル '{MODEL_FILE}' が見つかりません。")
     return AI_MODEL
 
-def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
+def generate_reason_with_groq(jcd, combo, prob, raw_data, odds):
     """
-    OpenAI互換クライアントでGroq APIを叩く（モデル交互利用）
+    OpenAI互換クライアントでGroq APIを叩く（オッズ分析付き）
     """
     client = get_groq_client()
     if not client:
         return f"AI推奨（自信度{prob}%）"
 
-    # ★ ご要望通り、スカウトと70Bをランダム（交互）に使用するロジックを維持
-    models = [
-        "meta-llama/llama-4-scout-17b-16e-instruct", 
-        "llama-3.3-70b-versatile"
-    ]
+    models = ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile"]
     selected_model = random.choice(models)
 
     players_info = ""
@@ -82,24 +78,35 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
         st = raw_data.get(f'st{s}', 0.0)
         players_info += f"{i}号艇: 勝率{wr:.2f} 機力{mo:.1f} 展示{ex:.2f} ST{st:.2f}\n"
 
+    # オッズ分析テキスト
+    odds_info = f"{odds}倍" if odds else "不明"
+    expectation = "不明"
+    if odds:
+        ev = (float(prob) / 100) * odds
+        expectation = f"{ev:.2f}"
+
     prompt = f"""
-    あなたはボートレースのプロ予想家です。
-    以下のデータに基づき、買い目「{combo}」を推奨する理由を、専門用語を交えて40文字以内で熱く語ってください。
+    あなたは辛口のボートレース投資家です。
+    以下のデータと「現在のオッズ」を分析し、買い目「{combo}」が投資としてアリかナシか、40文字以内で断言してください。
     
-    [データ]
-    会場: {jcd}場, 風速: {raw_data.get('wind', 0)}m
+    [レース環境]
+    会場:{jcd}場 風:{raw_data.get('wind', 0)}m
     {players_info}
-    [予測]
-    推奨: {combo}, 確率: {prob}%
+    
+    [AI予測]
+    推奨:{combo}
+    的中率:{prob}%
+    
+    [オッズ分析]
+    現在オッズ: {odds_info}
+    期待値指数: {expectation} (目安1.0以上)
     """
 
     try:
-        # レート制限対策の短い待機
         time.sleep(2.0)
-        
         chat_completion = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "あなたは的確なボートレース分析官です。"},
+                {"role": "system", "content": "あなたはプロの舟券師です。"},
                 {"role": "user", "content": prompt}
             ],
             model=selected_model, 
@@ -109,11 +116,10 @@ def generate_reason_with_groq(jcd, boat_no_list, combo, prob, raw_data):
         return chat_completion.choices[0].message.content.strip()
 
     except Exception as e:
-        # エラー時はバックアップ機能を使わず、エラー内容をログに出す
         print(f"❌ Groq API Error ({selected_model}): {e}")
-        return f"解説取得エラー"
+        return f"AI解説取得エラー"
 
-def attach_reason(results, raw):
+def attach_reason(results, raw, odds_value=None):
     if not results: return
     
     best_bet = results[0]
@@ -122,13 +128,13 @@ def attach_reason(results, raw):
     jcd = raw.get('jcd', 0)
     
     reason_msg = generate_reason_with_groq(
-        jcd, [int(x) for x in combo.split('-')], 
-        combo, prob, raw
+        jcd, combo, prob, raw, odds_value
     )
     
     for rank, item in enumerate(results):
         if rank == 0:
             item['reason'] = reason_msg
+            item['odds'] = odds_value
         else:
             item['reason'] = "同上（抑え）"
 
