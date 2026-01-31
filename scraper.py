@@ -64,6 +64,7 @@ def scrape_race_data(session, jcd, rno, date_str):
     url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_before = get_soup(session, url_before)
     
+    soup_list = None
     url_list = f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_list = get_soup(session, url_list)
 
@@ -104,10 +105,7 @@ def scrape_race_data(session, jcd, rno, date_str):
 
     # --- 各艇データ ---
     for i in range(1, 7):
-        # ★修正: 展示タイム取得ロジック（柔軟な探索）
-        found_ex = False
-        
-        # 1. 直前情報ページから探す
+        # 1. 直前情報ページから展示タイムを探す
         if soup_before:
             try:
                 # is-boatColor{i} を持つtdを探す
@@ -115,28 +113,16 @@ def scrape_race_data(session, jcd, rno, date_str):
                 if boat_td:
                     tr = boat_td.find_parent("tr")
                     if tr:
-                        # 行内の全テキストを結合して、正規表現で探す
                         text_all = clean_text(tr.text)
-                        # 展示タイムっぽい数値 (6.00〜7.50) を全て抽出
+                        # 展示タイム (6.xx または 7.00~7.50) を抽出
                         matches = re.findall(r"(6\.\d{2}|7\.[0-4]\d)", text_all)
                         if matches:
                             # 複数ある場合は一番最後（通常右端にあるため）を採用
                             row[f'ex{i}'] = float(matches[-1])
-                            found_ex = True
             except: pass
 
-        # 2. まだ見つからなければ、出走表ページも念のため探す
-        if not found_ex and soup_list:
-            try:
-                boat_td = soup_list.select_one(f"td.is-boatColor{i}")
-                if boat_td:
-                    tr = boat_td.find_parent("tr")
-                    if tr:
-                        text_all = clean_text(tr.text)
-                        matches = re.findall(r"(6\.\d{2}|7\.[0-4]\d)", text_all)
-                        if matches:
-                             row[f'ex{i}'] = float(matches[-1])
-            except: pass
+        # ★修正箇所：出走表(soup_list)から展示タイムを探す処理を削除
+        # 出走表にある「勝率(6.xx)」を展示タイムと誤認してしまうため。
 
         # 出走表データ（勝率・モーターなど）
         if soup_list:
