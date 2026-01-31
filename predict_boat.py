@@ -52,95 +52,141 @@ def load_model():
             raise FileNotFoundError(f"モデルファイル '{MODEL_FILE}' が見つかりません。")
     return AI_MODEL
 
-def generate_reason_with_groq(jcd, combo, prob, raw_data, odds):
+def generate_batch_reasons(jcd, bets_info, raw_data):
+    """
+    複数の買い目をまとめてAIに分析させ、個別のコメントを取得する
+    bets_info: [{'combo': '1-2-3', 'prob': 4.5, 'odds': 8.8, 'ev': 0.39}, ...]
+    """
     client = get_groq_client()
+    # クライアントが無い、またはオッズ情報が空なら簡易コメント
     if not client:
-        return f"AI推奨（自信度{prob}%）"
+        return {}
 
     models = ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.3-70b-versatile"]
     selected_model = random.choice(models)
 
+    # 選手情報作成
     players_info = ""
     for i in range(1, 7):
         s = str(i)
         wr = raw_data.get(f'wr{s}', 0.0)
         mo = raw_data.get(f'mo{s}', 0.0)
-        ex = raw_data.get(f'ex{s}', 0.0)
-        st = raw_data.get(f'st{s}', 0.0)
-        players_info += f"{i}号艇: 勝率{wr:.2f} 機力{mo:.1f} 展示{ex:.2f} ST{st:.2f}\n"
-
-    odds_info = f"{odds}倍" if odds else "不明"
-    expectation = "不明"
-    if odds:
-        ev = (float(prob) / 100) * odds
-        expectation = f"{ev:.2f}"
+        players_info += f"{i}号艇:勝率{wr:.2f}/機力{mo:.1f} "
+    
+    # 買い目リストのテキスト化
+    bets_text = ""
+    for b in bets_info:
+        odds_str = f"{b['odds']}倍" if b['odds'] else "不明"
+        ev_str = f"{b['ev']:.2f}" if b['ev'] else "-"
+        bets_text += f"- {b['combo']}: 確率{b['prob']}% オッズ{odds_str} (期待値{ev_str})\n"
 
     prompt = f"""
     あなたは辛口のボートレース投資家です。
-    以下のデータと「現在のオッズ」を分析し、買い目「{combo}」が投資としてアリかナシか、40文字以内で断言してください。
+    以下の{jcd}場のレースの「買い目リスト」を評価してください。
     
-    [レース環境]
-    会場:{jcd}場 風:{raw_data.get('wind', 0)}m
+    [選手データ]
     {players_info}
     
-    [AI予測]
-    推奨:{combo}
-    的中率:{prob}%
+    [買い目リスト]
+    {bets_text}
     
-    [オッズ分析]
-    現在オッズ: {odds_info}
-    期待値指数: {expectation} (目安1.0以上)
+    【重要】
+    各買い目に対して、オッズと確率のバランス（期待値）を見た上で、「投資すべきか」「危険か」「妙味ありか」など、
+    一言ずつ（20文字以内）で鋭いコメントを付けてください。
+    
+    出力形式は以下のように、買い目とコメントをコロンで区切って1行ずつ書いてください。余計な前置きは不要です。
+    
+    1-2-3: 本命だが配当安すぎ、見送り推奨。
+    1-2-4: このオッズなら狙う価値あり。
     """
 
     try:
         time.sleep(2.0)
         chat_completion = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "あなたはプロの舟券師です。"},
+                {"role": "system", "content": "あなたは実利重視のプロ舟券師です。"},
                 {"role": "user", "content": prompt}
             ],
             model=selected_model, 
             temperature=0.7,
-            max_tokens=100,
+            max_tokens=300,
         )
-        return chat_completion.choices[0].message.content.strip()
+        
+        response_text = chat_completion.choices[0].message.content.strip()
+        
+        # 応答をパースして辞書にする
+        comments = {}
+        for line in response_text.split('\n'):
+            if ':' in line:
+                parts = line.split(':', 1)
+                combo_key = parts[0].strip().replace("-", "").replace(" ", "") # 123形式で正規化トライ
+                combo_raw = parts[0].strip() # 1-2-3形式
+                comment = parts[1].strip()
+                
+                comments[combo_raw] = comment
+                
+        return comments
 
     except Exception as e:
-        print(f"❌ Groq API Error ({selected_model}): {e}")
-        return f"AI解説取得エラー"
+        print(f"❌ Groq API Error: {e}")
+        return {}
 
-# ★★★ 修正箇所: odds_map を受け取るように変更 ★★★
 def attach_reason(results, raw, odds_map=None):
     if not results: return
     if odds_map is None: odds_map = {}
     
-    # 1位の買い目について解説を生成
-    best_bet = results[0]
-    combo = best_bet['combo']
-    prob = best_bet['prob']
     jcd = raw.get('jcd', 0)
     
-    # この買い目のオッズを取得
-    my_odds = odds_map.get(combo)
-    
-    reason_msg = generate_reason_with_groq(
-        jcd, combo, prob, raw, my_odds
-    )
-    
-    # 各結果に正しいオッズと解説を割り当てる
-    for rank, item in enumerate(results):
-        item_combo = item['combo']
-        # 正しいオッズをマップから取得してセット
-        item['odds'] = odds_map.get(item_combo)
+    # 1. 分析用データの準備
+    bets_to_analyze = []
+    for item in results:
+        combo = item['combo']
+        prob = float(item['prob'])
+        odds = odds_map.get(combo)
         
-        if rank == 0:
-            item['reason'] = reason_msg
+        ev = None
+        if odds:
+            ev = (prob / 100) * odds
+            item['odds'] = odds # 結果に保存
+            item['ev'] = ev     # 結果に保存
+        
+        bets_to_analyze.append({
+            'combo': combo,
+            'prob': prob,
+            'odds': odds,
+            'ev': ev
+        })
+
+    # 2. AIに一括分析させる
+    ai_comments = generate_batch_reasons(jcd, bets_to_analyze, raw)
+    
+    # 3. 結果に割り当て
+    for item in results:
+        combo = item['combo']
+        ev_val = item.get('ev')
+        
+        # AIコメントがあればそれを使う
+        # AIがフォーマット通り返さない場合もあるので、キーの一致を柔軟に
+        ai_comment = ai_comments.get(combo)
+        
+        # 期待値表示の作成
+        ev_str = f"(EV:{ev_val:.2f})" if ev_val else ""
+        
+        if ai_comment:
+            item['reason'] = f"{ai_comment} {ev_str}"
         else:
-            # 2位以下もオッズが違えば期待値が変わるため、簡易コメントを入れる
-            if item.get('odds'):
-                item['reason'] = f"オッズ{item['odds']}倍"
+            # AIコメント取得失敗時のバックアップ（ルールベース）
+            if ev_val:
+                if ev_val >= 1.5:
+                    item['reason'] = f"🔥超抜期待値！迷わず買い。 {ev_str}"
+                elif ev_val >= 1.0:
+                    item['reason'] = f"配当妙味あり。 {ev_str}"
+                elif ev_val >= 0.8:
+                    item['reason'] = f"抑えとしては妥当。 {ev_str}"
+                else:
+                    item['reason'] = f"オッズ辛いが的中率でカバー。 {ev_str}"
             else:
-                item['reason'] = "同上（抑え）"
+                item['reason'] = "オッズ不明のため判断保留"
 
 def predict_race(raw, odds_data=None):
     model = load_model()
@@ -200,7 +246,7 @@ def predict_race(raw, odds_data=None):
             'profit': "計算中",
             'prob': f"{item['score']*100:.1f}",
             'roi': 0,
-            'reason': "待機中...",
+            'reason': "分析中...", # 初期値
             'deadline': raw.get('deadline_time', '不明')
         })
     return results
