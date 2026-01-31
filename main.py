@@ -8,7 +8,8 @@ import sys
 import requests as std_requests
 import json
 
-from scraper import scrape_race_data, get_session, scrape_odds, get_exact_odds
+# ★ get_odds_map に変更
+from scraper import scrape_race_data, get_session, get_odds_map
 from predict_boat import predict_race, attach_reason, load_model
 
 DB_FILE = "race_data.db"
@@ -161,18 +162,18 @@ def process_race(jcd, rno, today):
 
     log(f"⚡ {place}{rno}R で {len(new_preds)}件の候補を検知！オッズ取得＆AI解説生成中...")
     
-    # オッズ取得
-    best_combo = new_preds[0]['combo']
-    odds_val = None
+    # ★修正箇所：全オッズを一括取得する
+    odds_map = {}
     try:
-        odds_val = get_exact_odds(sess, jcd, rno, today, best_combo)
-        if odds_val:
-            log(f"💰 {place}{rno}R: 現在オッズ {odds_val}倍 を取得")
+        odds_map = get_odds_map(sess, jcd, rno, today)
+        if odds_map:
+            log(f"💰 {place}{rno}R: オッズ取得成功 ({len(odds_map)}件)")
     except Exception as e:
         log(f"⚠️ オッズ取得失敗: {e}")
 
     try:
-        attach_reason(preds, raw, odds_val)
+        # マップごと渡す
+        attach_reason(preds, raw, odds_map)
     except Exception as e:
         log(f"⚠️ 解説エラー: {e}")
 
@@ -186,8 +187,9 @@ def process_race(jcd, rno, today):
             prob = p['prob']
             reason = p.get('reason', '解説取得失敗')
             deadline = p.get('deadline', '不明')
+            odds_val = p.get('odds')
             
-            odds_log = f"({p.get('odds')}倍)" if p.get('odds') else ""
+            odds_log = f"({odds_val}倍)" if odds_val else ""
             log(f"🔥 [HIT] {place}{rno}R -> {combo} (確率:{prob}%) {odds_log}")
             
             odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
@@ -209,7 +211,7 @@ def process_race(jcd, rno, today):
         conn.close()
 
 def main():
-    log("🚀 最強AI Bot (本番運用モード v4.0) 起動 - オッズ分析機能搭載")
+    log("🚀 最強AI Bot (本番運用モード v4.1) 起動 - オッズ被り修正版")
     
     try:
         load_model()
