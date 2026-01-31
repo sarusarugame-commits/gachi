@@ -31,8 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # openai を削除し、Groq公式ライブラリ構成に戻しました
-          pip install pandas numpy lightgbm joblib beautifulsoup4 lxml curl_cffi requests groq scikit-learn
+          pip install pandas numpy lightgbm joblib beautifulsoup4 lxml curl_cffi requests openai scikit-learn
 
       - name: Run Bot
         env:
