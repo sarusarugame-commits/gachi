@@ -8,7 +8,6 @@ import random
 from itertools import permutations
 import json
 
-# ★ OpenAIライブラリ必須
 OPENAI_AVAILABLE = False
 try:
     from openai import OpenAI
@@ -21,12 +20,10 @@ _GROQ_CLIENT = None
 def get_groq_client():
     global _GROQ_CLIENT
     if not OPENAI_AVAILABLE: return None
-    
     if _GROQ_CLIENT is None:
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key: return None
         try:
-            # Groqのエンドポイントを指定して初期化
             _GROQ_CLIENT = OpenAI(
                 base_url="https://api.groq.com/openai/v1",
                 api_key=api_key,
@@ -38,8 +35,6 @@ def get_groq_client():
 
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
-
-# ★厳選設定: 閾値 4.0%
 STRATEGY_DEFAULT = {'th': 0.040, 'k': 5}
 STRATEGY = {}
 
@@ -50,7 +45,6 @@ def load_model():
             print(f"📂 モデルファイルを検出: {MODEL_FILE}")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
         elif os.path.exists(MODEL_FILE.replace(".txt", ".zip")):
-            print(f"📦 ZIPモデルを解凍中: {MODEL_FILE.replace('.txt', '.zip')}")
             with zipfile.ZipFile(MODEL_FILE.replace(".txt", ".zip"), 'r') as z:
                 z.extractall(".")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
@@ -59,9 +53,6 @@ def load_model():
     return AI_MODEL
 
 def generate_reason_with_groq(jcd, combo, prob, raw_data, odds):
-    """
-    OpenAI互換クライアントでGroq APIを叩く（オッズ分析付き）
-    """
     client = get_groq_client()
     if not client:
         return f"AI推奨（自信度{prob}%）"
@@ -78,7 +69,6 @@ def generate_reason_with_groq(jcd, combo, prob, raw_data, odds):
         st = raw_data.get(f'st{s}', 0.0)
         players_info += f"{i}号艇: 勝率{wr:.2f} 機力{mo:.1f} 展示{ex:.2f} ST{st:.2f}\n"
 
-    # オッズ分析テキスト
     odds_info = f"{odds}倍" if odds else "不明"
     expectation = "不明"
     if odds:
@@ -119,37 +109,48 @@ def generate_reason_with_groq(jcd, combo, prob, raw_data, odds):
         print(f"❌ Groq API Error ({selected_model}): {e}")
         return f"AI解説取得エラー"
 
-def attach_reason(results, raw, odds_value=None):
+# ★★★ 修正箇所: odds_map を受け取るように変更 ★★★
+def attach_reason(results, raw, odds_map=None):
     if not results: return
+    if odds_map is None: odds_map = {}
     
+    # 1位の買い目について解説を生成
     best_bet = results[0]
     combo = best_bet['combo']
     prob = best_bet['prob']
     jcd = raw.get('jcd', 0)
     
+    # この買い目のオッズを取得
+    my_odds = odds_map.get(combo)
+    
     reason_msg = generate_reason_with_groq(
-        jcd, combo, prob, raw, odds_value
+        jcd, combo, prob, raw, my_odds
     )
     
+    # 各結果に正しいオッズと解説を割り当てる
     for rank, item in enumerate(results):
+        item_combo = item['combo']
+        # 正しいオッズをマップから取得してセット
+        item['odds'] = odds_map.get(item_combo)
+        
         if rank == 0:
             item['reason'] = reason_msg
-            item['odds'] = odds_value
         else:
-            item['reason'] = "同上（抑え）"
+            # 2位以下もオッズが違えば期待値が変わるため、簡易コメントを入れる
+            if item.get('odds'):
+                item['reason'] = f"オッズ{item['odds']}倍"
+            else:
+                item['reason'] = "同上（抑え）"
 
 def predict_race(raw, odds_data=None):
     model = load_model()
-    
     jcd = raw.get('jcd', 0)
     wind = raw.get('wind', 0.0)
     rno = raw.get('rno', 0)
-    
     strat = STRATEGY.get(jcd, STRATEGY_DEFAULT)
     
     ex_values = [raw.get(f'ex{i}', 0) for i in range(1, 7)]
-    if sum(ex_values) == 0:
-        return []
+    if sum(ex_values) == 0: return []
 
     rows = []
     for i in range(1, 7):
@@ -170,28 +171,18 @@ def predict_race(raw, odds_data=None):
     df_race['jcd'] = df_race['jcd'].astype('category')
     df_race['pid'] = df_race['pid'].astype('category')
     
-    features = [
-        'jcd', 'boat_no', 'wind', 'pid',
-        'wr', 'mo', 'ex', 'st', 'f',
-        'wr_z', 'mo_z', 'ex_z', 'st_z'
-    ]
+    features = ['jcd', 'boat_no', 'wind', 'pid', 'wr', 'mo', 'ex', 'st', 'f', 'wr_z', 'mo_z', 'ex_z', 'st_z']
 
     try:
         preds = model.predict(df_race[features])
-        if preds.shape[1] < 3: return []
         p1, p2, p3 = preds[:, 0], preds[:, 1], preds[:, 2]
-    except Exception as e:
-        print(f"❌ {jcd}場{rno}R: 予測エラー {e}")
-        return []
+    except: return []
 
     b = df_race['boat_no'].values
     combos = []
     for i, j, k in permutations(range(6), 3):
         score = p1[i] * p2[j] * p3[k]
-        combos.append({
-            'combo': f"{b[i]}-{b[j]}-{b[k]}",
-            'score': score
-        })
+        combos.append({'combo': f"{b[i]}-{b[j]}-{b[k]}", 'score': score})
     combos.sort(key=lambda x: x['score'], reverse=True)
     
     best_bet = combos[0]
@@ -203,12 +194,11 @@ def predict_race(raw, odds_data=None):
 
     results = []
     for rank, item in enumerate(combos[:strat['k']]):
-        prob_percent = item['score'] * 100
         results.append({
             'combo': item['combo'],
             'type': f"ランク{rank+1}",
             'profit': "計算中",
-            'prob': f"{prob_percent:.1f}",
+            'prob': f"{item['score']*100:.1f}",
             'roi': 0,
             'reason': "待機中...",
             'deadline': raw.get('deadline_time', '不明')
