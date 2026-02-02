@@ -7,6 +7,7 @@ import time
 import random
 from itertools import permutations
 import json
+import sys
 
 OPENAI_AVAILABLE = False
 try:
@@ -36,41 +37,42 @@ def get_groq_client():
 MODEL_FILE = "boat_race_model_3t.txt"
 AI_MODEL = None
 
-# ★★★ 2025年 利益最大化ポートフォリオ (シミュレーション結果準拠) ★★★
-# 余計な会場は追加せず、シミュレーションで勝てると分かった設定のみを維持
+# ==========================================
+# 🎯 戦略設定 (シミュレーション結果準拠)
+# ==========================================
 
-STRATEGY_DEFAULT = {'th': 1.0, 'k': 0} 
+STRATEGY_DEFAULT = {'th': 0.070, 'k': 1}
 
 STRATEGY = {
     # 【関東】
-    1:  {'th': 0.055, 'k': 1},  # 桐生 (101%)
-    2:  {'th': 0.060, 'k': 3},  # 戸田 (190%)
-    3:  {'th': 0.055, 'k': 5},  # 江戸川 (136%)
-    5:  {'th': 0.070, 'k': 10}, # 多摩川 (119%)
+    1:  {'th': 0.055, 'k': 1},  # 桐生
+    2:  {'th': 0.060, 'k': 3},  # 戸田
+    3:  {'th': 0.055, 'k': 5},  # 江戸川
+    5:  {'th': 0.070, 'k': 10}, # 多摩川
     
     # 【東海】
-    6:  {'th': 0.070, 'k': 2},  # 浜名湖 (130%)
-    7:  {'th': 0.070, 'k': 1},  # 蒲郡 (243%)
-    8:  {'th': 0.070, 'k': 8},  # 常滑 (103%)
-    9:  {'th': 0.060, 'k': 3},  # 津 (138%)
+    6:  {'th': 0.070, 'k': 2},  # 浜名湖
+    7:  {'th': 0.070, 'k': 1},  # 蒲郡
+    8:  {'th': 0.070, 'k': 8},  # 常滑
+    9:  {'th': 0.060, 'k': 3},  # 津
     
     # 【北陸・近畿】
-    10: {'th': 0.070, 'k': 10}, # 三国 (191%)
-    11: {'th': 0.045, 'k': 1},  # びわこ (114%)
-    12: {'th': 0.050, 'k': 1},  # 住之江 (123%)
-    13: {'th': 0.065, 'k': 3},  # 尼崎 (111%)
+    10: {'th': 0.070, 'k': 10}, # 三国
+    11: {'th': 0.045, 'k': 1},  # びわこ
+    12: {'th': 0.050, 'k': 1},  # 住之江
+    13: {'th': 0.065, 'k': 3},  # 尼崎
     
     # 【四国・中国】
-    15: {'th': 0.070, 'k': 1},  # 丸亀 (124%)
-    16: {'th': 0.070, 'k': 1},  # 児島 (164%)
-    18: {'th': 0.080, 'k': 1},  # 徳山 (298%)
+    15: {'th': 0.070, 'k': 1},  # 丸亀
+    16: {'th': 0.070, 'k': 1},  # 児島
+    18: {'th': 0.080, 'k': 1},  # 徳山
     
     # 【九州】
-    20: {'th': 0.075, 'k': 10}, # 若松 (126%)
-    21: {'th': 0.065, 'k': 1},  # 芦屋 (119%)
-    22: {'th': 0.065, 'k': 1},  # 福岡 (155%)
-    23: {'th': 0.065, 'k': 1},  # 唐津 (138%)
-    24: {'th': 0.065, 'k': 1},  # 大村 (124%)
+    20: {'th': 0.075, 'k': 10}, # 若松
+    21: {'th': 0.065, 'k': 1},  # 芦屋
+    22: {'th': 0.065, 'k': 1},  # 福岡
+    23: {'th': 0.065, 'k': 1},  # 唐津
+    24: {'th': 0.065, 'k': 1},  # 大村
 }
 
 def load_model():
@@ -187,40 +189,110 @@ def attach_reason(results, raw, odds_map=None):
             else:
                 item['reason'] = "【判断不能】オッズ不明"
 
+# 安全な数値変換用のヘルパー関数
+def to_float(val):
+    try:
+        if val is None or val == "": return 0.0
+        return float(val)
+    except:
+        return 0.0
+
+# ==========================================
+# 🔮 予測ロジック (診断機能付き)
+# ==========================================
+
 def predict_race(raw, odds_data=None):
+    
+    # ▼▼▼▼▼▼▼▼▼▼▼▼ 診断用コード (ここから) ▼▼▼▼▼▼▼▼▼▼▼▼
+    # 目的: Botが受け取っているデータの正体（型・欠損）を暴く
+    print("\n🔍 --- DATA INSPECTION START ---")
+    
+    # 1. 生データの「型」を確認する (ここが <class 'str'> なら文字列バグ確定)
+    chk_wr = raw.get('wr1')
+    chk_ex = raw.get('ex1')
+    print(f"🧐 [型チェック] wr1: {chk_wr} ({type(chk_wr)})")
+    print(f"🧐 [型チェック] ex1: {chk_ex} ({type(chk_ex)})")
+
+    # 2. 展示タイムが取れているか確認
+    ex_vals = [raw.get(f'ex{i}') for i in range(1, 7)]
+    print(f"⏱ [展示タイム] 全艇データ: {ex_vals}")
+    
+    # 3. Zスコア計算のシミュレーション (もしここがNaNなら計算バグ確定)
+    try:
+        sample_vals = []
+        for i in range(1, 7):
+            val = raw.get(f'wr{i}')
+            # もし文字列なら無理やり変換してみるテスト
+            if isinstance(val, str): val = float(val) if val else 0
+            if val is None: val = 0
+            sample_vals.append(val)
+        
+        arr = np.array(sample_vals)
+        mean = np.mean(arr)
+        std = np.std(arr)
+        # 標準偏差が0の時は発散するので1e-6を入れるテスト
+        z_score = (arr[0] - mean) / (std + 1e-6)
+        print(f"🧮 [計算テスト] 1号艇Zスコア: {z_score:.4f} (平均:{mean:.2f} 標準偏差:{std:.2f})")
+    except Exception as e:
+        print(f"🔥 [計算エラー] Zスコア計算中に死亡: {e}")
+
+    print("🔍 --- DATA INSPECTION END ---\n")
+    # ▲▲▲▲▲▲▲▲▲▲▲▲ 診断用コード (ここまで) ▲▲▲▲▲▲▲▲▲▲▲▲
+
     model = load_model()
     
     jcd = raw.get('jcd', 0)
-    wind = raw.get('wind', 0.0)
+    wind = to_float(raw.get('wind', 0.0))
     rno = raw.get('rno', 0)
     
     strat = STRATEGY.get(jcd, STRATEGY_DEFAULT)
     
-    # 戦略が「見送り(k=0)」なら即終了
+    # 戦略除外(k=0)ならスキップ
     if strat['k'] == 0:
         return []
 
-    ex_values = [raw.get(f'ex{i}', 0) for i in range(1, 7)]
-    if sum(ex_values) == 0: return []
-
+    # 1. データの強制型変換 (診断結果がStringでも動くように念のため実装)
+    ex_list = []
     rows = []
+    
     for i in range(1, 7):
         s = str(i)
+        # 辞書から取得しつつ、必ずfloatにする
+        val_wr = to_float(raw.get(f'wr{s}', 0))
+        val_mo = to_float(raw.get(f'mo{s}', 0))
+        val_ex = to_float(raw.get(f'ex{s}', 0))
+        val_st = to_float(raw.get(f'st{s}', 0.20))
+        val_f  = to_float(raw.get(f'f{s}', 0))
+        
+        ex_list.append(val_ex)
+        
         rows.append({
-            'jcd': jcd, 'wind': wind, 'boat_no': i,
-            'pid': raw.get(f'pid{s}', 0), 'wr': raw.get(f'wr{s}', 0.0),
-            'mo': raw.get(f'mo{s}', 0.0), 'ex': raw.get(f'ex{s}', 0.0),
-            'st': raw.get(f'st{s}', 0.20), 'f': raw.get(f'f{s}', 0),
+            'jcd': jcd, 
+            'wind': wind, 
+            'boat_no': i,
+            'pid': raw.get(f'pid{s}', 0), 
+            'wr': val_wr,
+            'mo': val_mo, 
+            'ex': val_ex,
+            'st': val_st, 
+            'f': val_f,
         })
+    
+    # 展示タイムが全員0なら、データ取得ミスとしてスキップ
+    if sum(ex_list) == 0:
+        return []
+
     df_race = pd.DataFrame(rows)
 
-    # 偏差値(Z-score)計算
+    # 2. Zスコア計算 (0を含んで計算するシミュレーション準拠ロジック)
     target_cols = ['wr', 'mo', 'ex', 'st']
     for col in target_cols:
         mean_val = df_race[col].mean()
         std_val = df_race[col].std()
-        df_race[f'{col}_z'] = (df_race[col] - mean_val) / (std_val + 1e-6)
+        if std_val == 0: std_val = 1e-6
+        df_race[f'{col}_z'] = (df_race[col] - mean_val) / std_val
 
+    # カテゴリ型変換
     df_race['jcd'] = df_race['jcd'].astype('category')
     df_race['pid'] = df_race['pid'].astype('category')
     
@@ -234,7 +306,7 @@ def predict_race(raw, odds_data=None):
         preds = model.predict(df_race[features])
         p1, p2, p3 = preds[:, 0], preds[:, 1], preds[:, 2]
     except Exception as e:
-        print(f"Prediction Error: {e}")
+        print(f"❌ 予測エラー: {e}")
         return []
 
     b = df_race['boat_no'].values
@@ -242,18 +314,22 @@ def predict_race(raw, odds_data=None):
     for i, j, k in permutations(range(6), 3):
         score = p1[i] * p2[j] * p3[k]
         combos.append({'combo': f"{b[i]}-{b[j]}-{b[k]}", 'score': score})
-    combos.sort(key=lambda x: x['score'], reverse=True)
     
+    combos.sort(key=lambda x: x['score'], reverse=True)
     best_bet = combos[0]
-
-    # ★ ログ強化部分 ★
-    # スコアが閾値に届かなかった場合、惜しい（3%以上）ならログに出して通知する
+    
+    best_score_pct = best_bet['score'] * 100
+    threshold_pct = strat['th'] * 100
+    
+    # 診断ログ: 惜しいレースを表示 (3%以上)
     if best_bet['score'] < strat['th']:
-        if best_bet['score'] >= 0.03:
-            print(f"⚠️ [見送り] {jcd}場 {rno}R: {best_bet['combo']} スコア{best_bet['score']*100:.2f}% (閾値 {strat['th']*100:.1f}%に届かず)")
+        if best_bet['score'] > 0.03:
+             print(f"ℹ️ [見送] {jcd}場{rno}R 1位:{best_bet['combo']} ({best_score_pct:.2f}%) / 基準:{threshold_pct:.1f}%")
         return []
 
-    # セット買いロジック
+    # 条件クリア -> 購入リスト作成
+    print(f"🔥 [勝負] {jcd}場{rno}R 条件クリア! スコア:{best_score_pct:.2f}% >= 基準:{threshold_pct:.1f}%")
+    
     results = []
     for rank, item in enumerate(combos[:strat['k']]):
         results.append({
@@ -262,7 +338,7 @@ def predict_race(raw, odds_data=None):
             'profit': "計算中",
             'prob': f"{item['score']*100:.1f}",
             'roi': 0,
-            'reason': "待機中...",
+            'reason': "条件合致",
             'deadline': raw.get('deadline_time', '不明')
         })
         
