@@ -8,9 +8,9 @@ import sys
 import requests as std_requests
 import json
 
-# ★ get_odds_map に変更
 from scraper import scrape_race_data, get_session, get_odds_map
-from predict_boat import predict_race, attach_reason, load_model
+# ★ filter_and_sort_bets を追加インポート
+from predict_boat import predict_race, attach_reason, load_model, filter_and_sort_bets
 
 DB_FILE = "race_data.db"
 PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
@@ -43,7 +43,8 @@ def init_db():
     conn.close()
 
 def report_worker(stop_event):
-    log("ℹ️ レポート監視スレッド起動 (1点100円計算)")
+    # (変更なし)
+    log("ℹ️ レポート監視スレッド起動")
     while not stop_event.is_set():
         try:
             with DB_LOCK:
@@ -88,13 +89,7 @@ def report_worker(stop_event):
                             log(f"🎯 的中: {p['place']}{p['race_no']}R ({combo}) +{profit}円")
                             send_discord(msg)
                         else:
-                            msg = (
-                                f"💀 **{p['place']}{p['race_no']}R** ハズレ\n"
-                                f"予想: {combo} (結果: {result_str})\n"
-                                f"📅 **本日トータル: {total_profit:+,}円**"
-                            )
                             log(f"💀 ハズレ: {p['place']}{p['race_no']}R (結果:{result_str})")
-                            send_discord(msg)
                 conn.close()
         except Exception as e:
             pass
@@ -126,80 +121,76 @@ def process_race(jcd, rno, today):
             now = datetime.datetime.now(JST)
             h, m = map(int, deadline_str.split(':'))
             deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            
             if now > deadline_dt:
-                with FINISHED_RACES_LOCK:
-                    FINISHED_RACES.add((jcd, rno))
+                with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
                 with STATS_LOCK: STATS["skipped"] += 1
                 return
-
             if deadline_dt > (now + datetime.timedelta(minutes=60)):
                 with STATS_LOCK: STATS["skipped"] += 1
                 return
         except: pass
 
+    # 1. 一次候補 (確率判定)
     try:
-        preds = predict_race(raw)
+        candidates = predict_race(raw)
     except:
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    with STATS_LOCK: STATS["scanned"] += 1
-    if not preds: return
+    if not candidates:
+        with STATS_LOCK: STATS["scanned"] += 1
+        return
 
-    new_preds = []
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_FILE)
-        for p in preds:
-            combo = p['combo']
-            race_id = f"{today}_{jcd}_{rno}_{combo}"
-            exists = conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone()
-            if not exists:
-                new_preds.append(p)
-        conn.close()
-    
-    if not new_preds: return
-
-    log(f"⚡ {place}{rno}R で {len(new_preds)}件の候補を検知！オッズ取得＆AI解説生成中...")
-    
-    # ★修正箇所：全オッズを一括取得する
+    # 2. オッズ取得
     odds_map = {}
     try:
         odds_map = get_odds_map(sess, jcd, rno, today)
-        if odds_map:
-            log(f"💰 {place}{rno}R: オッズ取得成功 ({len(odds_map)}件)")
     except Exception as e:
         log(f"⚠️ オッズ取得失敗: {e}")
+        return
 
+    if not odds_map: return
+
+    # 3. ★EVフィルタリング (ここで絞り込む)
+    final_bets = filter_and_sort_bets(candidates, odds_map, jcd)
+    
+    with STATS_LOCK: STATS["scanned"] += 1
+    
+    if not final_bets: return
+
+    log(f"⚡ {place}{rno}R で {len(final_bets)}点の勝負買い目を検知！Groq解説生成中...")
+
+    # 4. ★Groqで解説付与
     try:
-        # マップごと渡す
-        attach_reason(preds, raw, odds_map)
+        attach_reason(final_bets, raw, odds_map)
     except Exception as e:
-        log(f"⚠️ 解説エラー: {e}")
+        log(f"⚠️ 解説生成エラー: {e}")
 
+    # 5. 投票＆通知
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE)
-        for p in new_preds:
+        for p in final_bets:
             combo = p['combo']
             race_id = f"{today}_{jcd}_{rno}_{combo}"
+            
             if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone(): continue
 
             prob = p['prob']
-            reason = p.get('reason', '解説取得失敗')
-            deadline = p.get('deadline', '不明')
             odds_val = p.get('odds')
+            ev_val = p.get('ev')
+            reason = p.get('reason', '解説なし')
+            deadline = raw.get('deadline_time', '不明')
             
-            odds_log = f"({odds_val}倍)" if odds_val else ""
-            log(f"🔥 [HIT] {place}{rno}R -> {combo} (確率:{prob}%) {odds_log}")
+            log(f"🔥 [BUY] {place}{rno}R -> {combo} (EV:{ev_val:.2f})")
             
             odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
 
             msg = (
-                f"🔥 **{place}{rno}R** 激アツ予想\n"
+                f"🔥 **{place}{rno}R** 勝負レース (Recov 130%)\n"
                 f"⏰ 締切: **{deadline}**\n"
                 f"🎯 買い目: **{combo}**\n"
-                f"📊 当選確率: **{prob}%**\n"
-                f"💰 現在オッズ: **{odds_val if odds_val else '不明'}倍**\n"
+                f"💰 期待値: **{ev_val:.2f}**\n"
+                f"📊 確率: {prob}% / オッズ: {odds_val}倍\n"
                 f"📝 解説: {reason}\n"
                 f"🔗 [オッズ確認]({odds_url})"
             )
@@ -211,7 +202,7 @@ def process_race(jcd, rno, today):
         conn.close()
 
 def main():
-    log("🚀 最強AI Bot (本番運用モード v4.1) 起動 - オッズ被り修正版")
+    log("🚀 最強AI Bot (Recovery 130% + Groq Ver) 起動")
     
     try:
         load_model()
@@ -246,7 +237,7 @@ def main():
             STATS["errors"] = 0
             STATS["skipped"] = 0
 
-        log(f"🔍 直近のレースをスキャン中 ({today})...")
+        log(f"🔍 スキャン開始 ({today})...")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             futures = []
@@ -255,7 +246,7 @@ def main():
                     futures.append(ex.submit(process_race, jcd, rno, today))
             concurrent.futures.wait(futures)
 
-        log(f"🏁 スキャン完了: 有効チェック={STATS['scanned']}, 範囲外スキップ={STATS['skipped']}, HIT={STATS['hits']}")
+        log(f"🏁 スキャン完了: 有効={STATS['scanned']}, 投資={STATS['hits']}")
         log("💤 待機中(300秒)...")
         time.sleep(300)
 
