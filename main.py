@@ -9,6 +9,7 @@ import requests as std_requests
 import json
 
 from scraper import scrape_race_data, get_session, get_odds_map
+# ★変更: filter_and_sort_bets を追加
 from predict_boat import predict_race, attach_reason, load_model, filter_and_sort_bets
 
 DB_FILE = "race_data.db"
@@ -18,7 +19,7 @@ JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 sys.stdout.reconfigure(encoding='utf-8')
 
 DB_LOCK = threading.Lock()
-STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0, "waiting": 0}
+STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0}
 STATS_LOCK = threading.Lock()
 FINISHED_RACES = set()
 FINISHED_RACES_LOCK = threading.Lock()
@@ -42,7 +43,7 @@ def init_db():
     conn.close()
 
 def report_worker(stop_event):
-    log("ℹ️ レポート監視スレッド起動")
+    log("ℹ️ レポート監視スレッド起動 (1点100円計算)")
     while not stop_event.is_set():
         try:
             with DB_LOCK:
@@ -87,6 +88,7 @@ def report_worker(stop_event):
                             log(f"🎯 的中: {p['place']}{p['race_no']}R ({combo}) +{profit}円")
                             send_discord(msg)
                         else:
+                            # ハズレ報告はログのみ
                             log(f"💀 ハズレ: {p['place']}{p['race_no']}R (結果:{result_str})")
                 conn.close()
         except Exception as e:
@@ -105,7 +107,6 @@ def process_race(jcd, rno, today):
     sess = get_session()
     place = PLACE_NAMES.get(jcd, "不明")
     
-    # 1. データ取得
     try:
         raw, error = scrape_race_data(sess, jcd, rno, today)
     except Exception as e:
@@ -114,7 +115,7 @@ def process_race(jcd, rno, today):
 
     if error or not raw: return
 
-    # ★ここが重要：時間管理ロジック★
+    # ★元のコードの「60分前チェック」をそのまま維持
     deadline_str = raw.get('deadline_time')
     if deadline_str:
         try:
@@ -122,25 +123,18 @@ def process_race(jcd, rno, today):
             h, m = map(int, deadline_str.split(':'))
             deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
             
-            # すでに締め切っていたら終了リストへ
             if now > deadline_dt:
-                with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
+                with FINISHED_RACES_LOCK:
+                    FINISHED_RACES.add((jcd, rno))
                 with STATS_LOCK: STATS["skipped"] += 1
                 return
 
-            # 残り時間を計算 (分)
-            delta = deadline_dt - now
-            minutes_left = delta.total_seconds() / 60
-
-            # 「締め切り20分前」になっていなければ、まだ早いのでスキップ
-            # (次回のループでまたチェックされるのでOK)
-            if minutes_left > 20:
-                with STATS_LOCK: STATS["waiting"] += 1
+            if deadline_dt > (now + datetime.timedelta(minutes=60)):
+                with STATS_LOCK: STATS["skipped"] += 1
                 return
-            
         except: pass
 
-    # 2. 一次候補 (確率判定)
+    # 1. 候補出し（確率判定のみ）
     try:
         candidates = predict_race(raw)
     except:
@@ -151,52 +145,55 @@ def process_race(jcd, rno, today):
         with STATS_LOCK: STATS["scanned"] += 1
         return
 
-    # 3. オッズ取得 (直前オッズ！)
+    # 2. ★ここでオッズ取得（候補がある場合のみ）
     odds_map = {}
     try:
         odds_map = get_odds_map(sess, jcd, rno, today)
     except Exception as e:
         log(f"⚠️ オッズ取得失敗: {e}")
+        # オッズが取れなければ勝負できないので終了
         return
 
     if not odds_map: return
 
-    # 4. EVフィルタリング
+    # 3. ★EVフィルタリングで厳選
     final_bets = filter_and_sort_bets(candidates, odds_map, jcd)
     
     with STATS_LOCK: STATS["scanned"] += 1
     
     if not final_bets: return
 
-    log(f"⚡ {place}{rno}R (締切{minutes_left:.1f}分前) 勝負買い目あり！Groq解説生成中...")
+    log(f"⚡ {place}{rno}R で {len(final_bets)}点の勝負買い目を検知！Groq解説生成中...")
 
-    # 5. 解説付与
+    # 4. ★Groq解説付与
     try:
         attach_reason(final_bets, raw, odds_map)
     except Exception as e:
-        log(f"⚠️ 解説生成エラー: {e}")
+        log(f"⚠️ 解説エラー: {e}")
 
-    # 6. 投票＆通知
+    # 5. DB保存・通知
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE)
         for p in final_bets:
             combo = p['combo']
             race_id = f"{today}_{jcd}_{rno}_{combo}"
             
+            # 重複チェック
             if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone(): continue
 
             prob = p['prob']
             odds_val = p.get('odds')
             ev_val = p.get('ev')
-            reason = p.get('reason', '解説なし')
+            reason = p.get('reason', '解説取得失敗')
+            deadline = raw.get('deadline_time', '不明')
             
             log(f"🔥 [BUY] {place}{rno}R -> {combo} (EV:{ev_val:.2f})")
             
             odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={today}"
 
             msg = (
-                f"🔥 **{place}{rno}R** 直前スナイプ！\n"
-                f"⏰ 締切: **{deadline_str}** (あと{minutes_left:.0f}分)\n"
+                f"🔥 **{place}{rno}R** 勝負レース (Recov 130%)\n"
+                f"⏰ 締切: **{deadline}**\n"
                 f"🎯 買い目: **{combo}**\n"
                 f"💰 期待値: **{ev_val:.2f}**\n"
                 f"📊 確率: {prob}% / オッズ: {odds_val}倍\n"
@@ -211,7 +208,7 @@ def process_race(jcd, rno, today):
         conn.close()
 
 def main():
-    log("🚀 最強AI Bot (直前スナイプ & Recovery 130% Ver) 起動")
+    log("🚀 最強AI Bot (Recovery 130% + 元の運用ロジック) 起動")
     
     try:
         load_model()
@@ -226,9 +223,10 @@ def main():
     t.start()
     
     start_time = time.time()
-    MAX_RUNTIME = 21000  # 約5.8時間 (GitHub Actionsの制限対策)
+    MAX_RUNTIME = 21000 
     
     while True:
+        # ★再起動用の制限時間チェック（ここも元のまま維持）
         if time.time() - start_time > MAX_RUNTIME:
             log("🔄 稼働時間上限により停止")
             break
@@ -245,10 +243,10 @@ def main():
             STATS["hits"] = 0
             STATS["errors"] = 0
             STATS["skipped"] = 0
-            STATS["waiting"] = 0
 
-        log(f"🔍 直前レースのスキャン中 ({today})...")
+        log(f"🔍 直近のレースをスキャン中 ({today})...")
         
+        # ★元のRごとのスキャン順序を維持
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             futures = []
             for rno in range(1, 13):
@@ -256,11 +254,9 @@ def main():
                     futures.append(ex.submit(process_race, jcd, rno, today))
             concurrent.futures.wait(futures)
 
-        log(f"🏁 スキャン完了: 判定={STATS['scanned']}, 待機中={STATS['waiting']}, 投資={STATS['hits']}")
-        
-        # 3分待機 (頻繁すぎず、かつ直前を逃さない間隔)
-        log("💤 180秒待機...")
-        time.sleep(180)
+        log(f"🏁 スキャン完了: 有効チェック={STATS['scanned']}, 範囲外スキップ={STATS['skipped']}, HIT={STATS['hits']}")
+        log("💤 待機中(300秒)...")
+        time.sleep(300)
 
     stop_event.set()
 
