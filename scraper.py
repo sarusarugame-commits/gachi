@@ -127,7 +127,6 @@ def scrape_race_data(session, jcd, rno, date_str):
             except: pass
     return row, None
 
-# ★★★ 新機能: 全オッズを一括取得する関数 ★★★
 def get_odds_map(session, jcd, rno, date_str):
     """
     3連単の全オッズを取得し、辞書形式で返す
@@ -139,64 +138,73 @@ def get_odds_map(session, jcd, rno, date_str):
 
     odds_map = {}
     
+    # "table1" クラスの中にあるテーブルを取得
     tables = soup.select("div.table1 table")
-    target_tbody = None
-    for tbl in tables:
-        if "3連単" in tbl.text or "締切" not in tbl.text:
-            tbody = tbl.select_one("tbody")
-            if tbody:
-                target_tbody = tbody
-                break
     
-    if not target_tbody: return {}
-    rows = target_tbody.select("tr")
-
-    # ステートマシン用変数
-    rowspan_counters = [0] * 6
-    current_2nd_boats = [0] * 6
-
-    for tr in rows:
-        tds = tr.select("td")
-        col_cursor = 0
-        
-        for block_idx in range(6):
-            if col_cursor >= len(tds): break
-            current_1st = block_idx + 1 
+    # 複数のテーブルに分かれている可能性も考慮し、合致する全テーブルを走査
+    for tbl in tables:
+        # 明確に「3連単」のオッズテーブルだけを対象にする
+        if "3連単" not in tbl.text:
+            continue
             
-            if rowspan_counters[block_idx] > 0:
-                if col_cursor + 1 >= len(tds): break
-                val_2nd = current_2nd_boats[block_idx]
-                
-                txt_3rd = clean_text(tds[col_cursor].text)
-                txt_odds = clean_text(tds[col_cursor+1].text)
-                
-                rowspan_counters[block_idx] -= 1
-                col_cursor += 2
-                
-            else:
-                if col_cursor + 2 >= len(tds): break
-                td_2nd = tds[col_cursor]
-                txt_2nd = clean_text(td_2nd.text)
-                
-                rs = int(td_2nd.get("rowspan", 1))
-                rowspan_counters[block_idx] = rs - 1
-                
-                try: val_2nd = int(txt_2nd)
-                except: val_2nd = 0
-                current_2nd_boats[block_idx] = val_2nd
-                
-                txt_3rd = clean_text(tds[col_cursor+1].text)
-                txt_odds = clean_text(tds[col_cursor+2].text)
-                
-                col_cursor += 3
+        tbody = tbl.select_one("tbody")
+        if not tbody: continue
+        
+        rows = tbody.select("tr")
 
-            # 辞書に保存
-            try:
-                if val_2nd > 0 and txt_3rd.isdigit():
-                    key = f"{current_1st}-{val_2nd}-{txt_3rd}"
-                    odds_map[key] = float(txt_odds)
-            except:
-                continue
+        # 各列の状態管理（テーブルごとにリセット）
+        rowspan_counters = [0] * 6
+        current_2nd_boats = [0] * 6
+
+        for tr in rows:
+            tds = tr.select("td")
+            col_cursor = 0
+            
+            # 最大6列（1号艇〜6号艇頭）を想定
+            for block_idx in range(6):
+                if col_cursor >= len(tds): break
+                
+                # テーブルが分かれている場合、block_idx は必ずしも 1号艇, 2号艇... と一致しない可能性があるが
+                # 公式サイトの構造上、左から順に詰まっているためこのループで処理可能
+                current_1st = block_idx + 1 
+                
+                if rowspan_counters[block_idx] > 0:
+                    # 結合中：3着とオッズのみ消費
+                    if col_cursor + 1 >= len(tds): break
+                    val_2nd = current_2nd_boats[block_idx]
+                    
+                    txt_3rd = clean_text(tds[col_cursor].text)
+                    txt_odds = clean_text(tds[col_cursor+1].text)
+                    
+                    rowspan_counters[block_idx] -= 1
+                    col_cursor += 2
+                    
+                else:
+                    # 新しい2着：2着、3着、オッズを消費
+                    if col_cursor + 2 >= len(tds): break
+                    td_2nd = tds[col_cursor]
+                    txt_2nd = clean_text(td_2nd.text)
+                    
+                    rs = int(td_2nd.get("rowspan", 1))
+                    rowspan_counters[block_idx] = rs - 1
+                    
+                    try: val_2nd = int(txt_2nd)
+                    except: val_2nd = 0
+                    current_2nd_boats[block_idx] = val_2nd
+                    
+                    txt_3rd = clean_text(tds[col_cursor+1].text)
+                    txt_odds = clean_text(tds[col_cursor+2].text)
+                    
+                    col_cursor += 3
+
+                # 辞書に保存
+                try:
+                    # 欠場などで数字でない場合はスキップ
+                    if val_2nd > 0 and txt_3rd.isdigit():
+                        key = f"{current_1st}-{val_2nd}-{txt_3rd}"
+                        odds_map[key] = float(txt_odds)
+                except:
+                    continue
 
     return odds_map
 
