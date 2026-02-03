@@ -16,7 +16,7 @@ permissions:
 jobs:
   run-race-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360 # 最大6時間で強制終了（それまではループし続ける）
 
     steps:
       - name: Checkout
@@ -33,25 +33,45 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy lightgbm joblib beautifulsoup4 lxml curl_cffi requests openai scikit-learn
 
-      - name: Run Bot
+      # ▼▼▼ ここを修正（無限ループ＆自動保存機能付き） ▼▼▼
+      - name: Run Bot with Auto-Restart
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           PYTHONUNBUFFERED: '1'
         run: |
-          python main.py
-
-      - name: Save Database
-        if: always()
-        run: |
+          # Gitの初期設定（ループの前に行う）
           git config --global user.name "github-actions[bot]"
           git config --global user.email "bot@noreply.github.com"
-          git fetch origin main
-          git reset --soft origin/main
-          git add race_data.db
-          if git diff --staged --quiet; then
-            echo "No changes."
-          else
-            git commit -m "Update DB [skip ci]"
-            git push origin main
-          fi
+
+          echo "🔄 無限ループモードでBotを起動します..."
+
+          # 無限ループ開始
+          while true; do
+            echo "------------------------------------------------"
+            echo "🚀 Botを起動します"
+            echo "------------------------------------------------"
+            
+            # Pythonを実行
+            python main.py
+            
+            echo "⚠️ Botが停止しました。データを保存して再起動します..."
+            
+            # ▼▼▼ 停止のたびにデータを保存（ここに追加） ▼▼▼
+            git fetch origin main
+            git reset --soft origin/main
+            git add race_data.db
+            
+            # 変更がある場合のみコミット＆プッシュ
+            if git diff --staged --quiet; then
+              echo "変更なし。スキップします。"
+            else
+              git commit -m "Auto-save DB after stop [skip ci]"
+              git push origin main
+              echo "💾 データを保存しました。"
+            fi
+            # ▲▲▲ 保存処理終了 ▲▲▲
+
+            echo "💤 10秒待機後に再起動します..."
+            sleep 10
+          done
