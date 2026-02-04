@@ -8,22 +8,21 @@ import random
 from itertools import permutations
 
 # ==========================================
-# ⚙️ 設定: 回収率130%ロジック
+# ⚙️ 設定: バランス型 (毎日楽しめる設定)
 # ==========================================
 MODEL_FILE = "boatrace_model.txt"
 
 # フィルタ設定
-MIN_PROB_THRESHOLD = 0.03       # 確率3%以上のみ候補にする
-MAX_BETS_PER_RACE = 6           # 1レース最大6点
-CALC_ODDS_CAP = 40.0            # オッズキャップ
+MIN_PROB_THRESHOLD = 0.02       # 確率2%以上
+MAX_BETS_PER_RACE = 12          # 1レース最大12点
+CALC_ODDS_CAP = 50.0            # オッズキャップ50倍
 
-# 会場ごとの最適EV閾値 (2023-2025分析結果)
+# 全会場一律で「EV 1.2」以上ならGO
 BEST_EV_THRESHOLDS = {
-    1: 1.4,  2: 1.8,  3: 99.9, 4: 1.2,  5: 99.9, 6: 1.5,
-    7: 1.8,  8: 99.9, 9: 1.3,  10: 1.8, 11: 2.0, 12: 99.9,
-    13: 2.0, 14: 1.4, 15: 1.8, 16: 1.8, 17: 2.0, 18: 2.0,
-    19: 1.6, 20: 1.8, 21: 1.4, 22: 1.4, 23: 1.3, 24: 99.9
+    k: 1.2 for k in range(1, 25)
 }
+# 特定の得意会場だけ少し厳選
+BEST_EV_THRESHOLDS[23] = 1.3 
 
 # ==========================================
 # 🤖 Groq / OpenAI 設定
@@ -55,7 +54,6 @@ AI_MODEL = None
 def load_model():
     global AI_MODEL
     if AI_MODEL is None:
-        # 新モデル優先
         if os.path.exists(MODEL_FILE):
             print(f"📂 モデルファイルを検出: {MODEL_FILE}")
             AI_MODEL = lgb.Booster(model_file=MODEL_FILE)
@@ -77,8 +75,7 @@ def to_float(val):
 # ==========================================
 def predict_race(raw):
     """
-    確率3%以上の買い目を広めに抽出して返す。
-    オッズによる絞り込みはまだ行わない。
+    戻り値: (候補リスト, 最大自信度)
     """
     model = load_model()
     jcd = raw.get('jcd', 0)
@@ -100,7 +97,7 @@ def predict_race(raw):
             'f': to_float(raw.get(f'f{s}', 0)),
         })
     
-    if sum(ex_list) == 0: return []
+    if sum(ex_list) == 0: return [], 0.0
 
     df_race = pd.DataFrame(rows)
     for col in ['wr', 'mo', 'ex', 'st']:
@@ -117,10 +114,14 @@ def predict_race(raw):
     try:
         preds = model.predict(df_race[features])
         p1, p2, p3 = preds[:, 0], preds[:, 1], preds[:, 2]
-    except: return []
+    except: return [], 0.0
 
-    # 自信度チェック (自信がないレースはここで弾く)
-    if max(p1) < 0.20: return []
+    max_win_prob = max(p1)
+
+    # ★自信度が低くても(15%)とりあえず候補に出す
+    # ただし、main.pyでログ出すために、空リストと共に自信度も返す
+    if max_win_prob < 0.15:
+        return [], max_win_prob
 
     b = df_race['boat_no'].values
     candidates = []
@@ -134,19 +135,20 @@ def predict_race(raw):
             })
     
     candidates.sort(key=lambda x: x['raw_prob'], reverse=True)
-    return candidates[:20] # EV計算用に上位20件を返す
+    return candidates[:30], max_win_prob
 
 # ==========================================
-# 💰 2. EVフィルタ (ここで厳選)
+# 💰 2. EVフィルタ
 # ==========================================
 def filter_and_sort_bets(candidates, odds_map, jcd):
     """
-    候補リストにオッズを当てて、EV閾値を超えたものだけを返す
+    戻り値: (最終買い目リスト, 最大EV, 閾値)
     """
-    threshold = BEST_EV_THRESHOLDS.get(jcd, 99.9)
-    if threshold >= 99.0: return [] # 見送り会場
-
+    threshold = BEST_EV_THRESHOLDS.get(jcd, 1.2)
+    
     final_bets = []
+    max_ev = 0.0
+
     for bet in candidates:
         combo = bet['combo']
         prob = bet['raw_prob']
@@ -157,15 +159,17 @@ def filter_and_sort_bets(candidates, odds_map, jcd):
         calc_odds = min(real_odds, CALC_ODDS_CAP)
         ev = prob * calc_odds
         
+        # ログ用に最大EVを記録
+        if ev > max_ev: max_ev = ev
+        
         if ev >= threshold:
             bet['odds'] = real_odds
             bet['ev'] = ev
-            # reasonは後でGroqで上書きされるが、基本形を入れておく
             bet['reason'] = f"EV:{ev:.2f} (基準{threshold})"
             final_bets.append(bet)
             
     final_bets.sort(key=lambda x: x['ev'], reverse=True)
-    return final_bets[:MAX_BETS_PER_RACE]
+    return final_bets[:MAX_BETS_PER_RACE], max_ev, threshold
 
 # ==========================================
 # 📝 3. 解説生成
@@ -174,7 +178,6 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
     client = get_groq_client()
     if not client: return {}
     
-    # 選手情報
     players_info = ""
     for i in range(1, 7):
         players_info += f"{i}号艇:勝率{raw_data.get(f'wr{i}',0)} "
@@ -184,17 +187,14 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
         bets_text += f"- {b['combo']}: 確率{b['prob']}% オッズ{b['odds']} (EV{b['ev']:.2f})\n"
 
     prompt = f"""
-    ボートレースのベテラン予想家として、以下の{jcd}場の推奨買い目を解説してください。
+    ボートレース予想家として、以下の{jcd}場の買い目を解説せよ。
     
     [選手] {players_info}
     [買い目] {bets_text}
     
     【指示】
-    各買い目について、なぜチャンスなのか **30文字以内** で平易にコメントしてください。
-    必ず **【勝負】** か **【見送り】** で始めてください。
-    
-    出力形式:
-    1-2-3: 【勝負】 1番が盤石！配当も美味しく狙い目。
+    各買い目について、なぜチャンスなのか **30文字以内** でコメント。
+    必ず **【勝負】** か **【見送り】** で始めること。
     """
     
     try:
@@ -214,13 +214,11 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
 def attach_reason(results, raw, odds_map):
     if not results: return
     jcd = raw.get('jcd', 0)
-    
     ai_comments = generate_batch_reasons(jcd, results, raw)
-    
     for item in results:
         combo = item['combo']
         ai_msg = ai_comments.get(combo)
         if ai_msg:
             item['reason'] = f"{ai_msg} (EV:{item['ev']:.2f})"
         else:
-            item['reason'] = f"【勝負】AI高期待値 (EV:{item['ev']:.2f})"
+            item['reason'] = f"【勝負】AI推奨 (EV:{item['ev']:.2f})"
