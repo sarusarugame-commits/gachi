@@ -18,7 +18,8 @@ JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 sys.stdout.reconfigure(encoding='utf-8')
 
 DB_LOCK = threading.Lock()
-STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0, "waiting": 0}
+# 統計情報のキーに 'passed' (見送り) を追加
+STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0, "waiting": 0, "passed": 0}
 STATS_LOCK = threading.Lock()
 FINISHED_RACES = set()
 FINISHED_RACES_LOCK = threading.Lock()
@@ -133,7 +134,6 @@ def process_race(jcd, rno, today):
             minutes_left = delta.total_seconds() / 60
 
             # 「締め切り20分前」になっていなければ、まだ早いので待機リストへ
-            # (リターンして次のループでまたチェックする)
             if minutes_left > 20:
                 with STATS_LOCK: STATS["waiting"] += 1
                 return
@@ -142,13 +142,23 @@ def process_race(jcd, rno, today):
 
     # 2. 一次候補 (確率判定)
     try:
-        candidates = predict_race(raw)
+        # predict_race は (candidates, max_prob) を返す
+        ret_predict = predict_race(raw)
+        if isinstance(ret_predict, tuple):
+            candidates, max_conf = ret_predict
+        else:
+            candidates = ret_predict
+            max_conf = 0.0
     except:
         with STATS_LOCK: STATS["errors"] += 1
         return
 
     if not candidates:
-        with STATS_LOCK: STATS["scanned"] += 1
+        with STATS_LOCK: 
+            STATS["scanned"] += 1
+            STATS["passed"] += 1
+        # ★見送り理由ログ（自信度不足）
+        log(f"👀 {place}{rno}R 見送り: 自信度不足 ({max_conf:.1%} < 15.0%)")
         return
 
     # 3. オッズ取得 (直前オッズ！)
@@ -162,11 +172,25 @@ def process_race(jcd, rno, today):
     if not odds_map: return
 
     # 4. EVフィルタリング
-    final_bets = filter_and_sort_bets(candidates, odds_map, jcd)
+    try:
+        # filter_and_sort_bets は (final_bets, max_ev, threshold) を返す
+        ret_filter = filter_and_sort_bets(candidates, odds_map, jcd)
+        if isinstance(ret_filter, tuple):
+            final_bets, max_ev, ev_thresh = ret_filter
+        else:
+            final_bets = ret_filter
+            max_ev = 0.0
+            ev_thresh = 0.0
+    except:
+        return
     
     with STATS_LOCK: STATS["scanned"] += 1
     
-    if not final_bets: return
+    if not final_bets:
+        with STATS_LOCK: STATS["passed"] += 1
+        # ★見送り理由ログ（期待値不足）
+        log(f"👀 {place}{rno}R 見送り: 期待値不足 (Max EV:{max_ev:.2f} < {ev_thresh})")
+        return
 
     log(f"⚡ {place}{rno}R (締切{minutes_left:.1f}分前) 勝負買い目あり！Groq解説生成中...")
 
@@ -247,6 +271,7 @@ def main():
             STATS["errors"] = 0
             STATS["skipped"] = 0
             STATS["waiting"] = 0
+            STATS["passed"] = 0
 
         log(f"🔍 直前レースのスキャン中 ({today})...")
         
@@ -258,7 +283,8 @@ def main():
                     futures.append(ex.submit(process_race, jcd, rno, today))
             concurrent.futures.wait(futures)
 
-        log(f"🏁 スキャン完了: 判定={STATS['scanned']}, 待機中={STATS['waiting']}, 投資={STATS['hits']}")
+        # ★ ログを改良: 対象(母数) -> 見送り(棄却) / 購入(採用) の内訳を表示
+        log(f"🏁 判定完了: 対象={STATS['scanned']}R -> 見送={STATS['passed']}R, 購入={STATS['hits']}R (待機={STATS['waiting']}R)")
         
         # 3分待機 (頻繁すぎず、かつ直前を逃さない間隔)
         log("💤 180秒待機...")
