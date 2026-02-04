@@ -18,7 +18,7 @@ JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 sys.stdout.reconfigure(encoding='utf-8')
 
 DB_LOCK = threading.Lock()
-# 統計情報のキーに 'passed' (見送り) を追加
+# 統計情報の項目を網羅
 STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0, "waiting": 0, "passed": 0}
 STATS_LOCK = threading.Lock()
 FINISHED_RACES = set()
@@ -98,9 +98,9 @@ def report_worker(stop_event):
             time.sleep(60)
 
 def process_race(jcd, rno, today):
+    # 既に終了したレースはスキップ（ログは出さない）
     with FINISHED_RACES_LOCK:
         if (jcd, rno) in FINISHED_RACES:
-            with STATS_LOCK: STATS["skipped"] += 1
             return
 
     sess = get_session()
@@ -111,11 +111,17 @@ def process_race(jcd, rno, today):
         raw, error = scrape_race_data(sess, jcd, rno, today)
     except Exception as e:
         with STATS_LOCK: STATS["errors"] += 1
+        log(f"⚠️ {place}{rno}R データ取得例外: {e}")
         return
 
-    if error or not raw: return
+    # ★修正: 取得失敗時もカウント＆ログ出し
+    if error or not raw:
+        with STATS_LOCK: STATS["errors"] += 1
+        # 頻繁に出るようならコメントアウトしても良い
+        # log(f"⚠️ {place}{rno}R データ取得失敗") 
+        return
 
-    # ★ここが重要：時間管理ロジック★
+    # ★時間管理ロジック★
     deadline_str = raw.get('deadline_time')
     if deadline_str:
         try:
@@ -127,13 +133,14 @@ def process_race(jcd, rno, today):
             if now > deadline_dt:
                 with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
                 with STATS_LOCK: STATS["skipped"] += 1
+                log(f"⌛ {place}{rno}R 締切時刻経過 (Skipped)")
                 return
 
             # 残り時間を計算 (分)
             delta = deadline_dt - now
             minutes_left = delta.total_seconds() / 60
 
-            # 「締め切り20分前」になっていなければ、まだ早いので待機リストへ
+            # 「締め切り20分前」になっていなければ、待機リストへ
             if minutes_left > 20:
                 with STATS_LOCK: STATS["waiting"] += 1
                 return
@@ -149,15 +156,15 @@ def process_race(jcd, rno, today):
         else:
             candidates = ret_predict
             max_conf = 0.0
-    except:
+    except Exception as e:
         with STATS_LOCK: STATS["errors"] += 1
+        log(f"⚠️ {place}{rno}R 予測エラー: {e}")
         return
 
     if not candidates:
         with STATS_LOCK: 
             STATS["scanned"] += 1
             STATS["passed"] += 1
-        # ★見送り理由ログ（自信度不足）
         log(f"👀 {place}{rno}R 見送り: 自信度不足 ({max_conf:.1%} < 15.0%)")
         return
 
@@ -166,14 +173,16 @@ def process_race(jcd, rno, today):
     try:
         odds_map = get_odds_map(sess, jcd, rno, today)
     except Exception as e:
-        log(f"⚠️ オッズ取得失敗: {e}")
+        with STATS_LOCK: STATS["errors"] += 1
+        log(f"⚠️ {place}{rno}R オッズ取得失敗: {e}")
         return
 
-    if not odds_map: return
+    if not odds_map:
+        with STATS_LOCK: STATS["errors"] += 1
+        return
 
     # 4. EVフィルタリング
     try:
-        # filter_and_sort_bets は (final_bets, max_ev, threshold) を返す
         ret_filter = filter_and_sort_bets(candidates, odds_map, jcd)
         if isinstance(ret_filter, tuple):
             final_bets, max_ev, ev_thresh = ret_filter
@@ -181,14 +190,14 @@ def process_race(jcd, rno, today):
             final_bets = ret_filter
             max_ev = 0.0
             ev_thresh = 0.0
-    except:
+    except Exception as e:
+        with STATS_LOCK: STATS["errors"] += 1
         return
     
     with STATS_LOCK: STATS["scanned"] += 1
     
     if not final_bets:
         with STATS_LOCK: STATS["passed"] += 1
-        # ★見送り理由ログ（期待値不足）
         log(f"👀 {place}{rno}R 見送り: 期待値不足 (Max EV:{max_ev:.2f} < {ev_thresh})")
         return
 
@@ -250,10 +259,9 @@ def main():
     t.start()
     
     start_time = time.time()
-    MAX_RUNTIME = 18000  # ★5時間 (1時間の余裕を持たせる)
+    MAX_RUNTIME = 18000
     
     while True:
-        # ★稼働時間チェック (ここで安全に終了する)
         if time.time() - start_time > MAX_RUNTIME:
             log("🔄 稼働時間上限(5時間)に達したため停止します")
             break
@@ -275,7 +283,6 @@ def main():
 
         log(f"🔍 直前レースのスキャン中 ({today})...")
         
-        # ★全レース場を Rごとに 並列チェック (元のロジック維持)
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             futures = []
             for rno in range(1, 13):
@@ -283,10 +290,10 @@ def main():
                     futures.append(ex.submit(process_race, jcd, rno, today))
             concurrent.futures.wait(futures)
 
-        # ★ ログを改良: 対象(母数) -> 見送り(棄却) / 購入(採用) の内訳を表示
-        log(f"🏁 判定完了: 対象={STATS['scanned']}R -> 見送={STATS['passed']}R, 購入={STATS['hits']}R (待機={STATS['waiting']}R)")
+        # ★ ログを完全化: 全ての数字を表示
+        log(f"🏁 判定完了: 対象={STATS['scanned']}R -> 見送={STATS['passed']}R, 購入={STATS['hits']}R "
+            f"(待機={STATS['waiting']}R, 期限切={STATS['skipped']}R, エラー={STATS['errors']}R)")
         
-        # 3分待機 (頻繁すぎず、かつ直前を逃さない間隔)
         log("💤 180秒待機...")
         time.sleep(180)
 
