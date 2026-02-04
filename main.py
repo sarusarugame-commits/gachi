@@ -8,6 +8,7 @@ import sys
 import requests as std_requests
 import json
 
+# scraper.pyも更新が必要です
 from scraper import scrape_race_data, get_session, get_odds_map
 from predict_boat import predict_race, attach_reason, load_model, filter_and_sort_bets
 
@@ -21,8 +22,13 @@ DB_LOCK = threading.Lock()
 # 統計情報の項目を網羅
 STATS = {"scanned": 0, "hits": 0, "errors": 0, "skipped": 0, "waiting": 0, "passed": 0}
 STATS_LOCK = threading.Lock()
+
 FINISHED_RACES = set()
 FINISHED_RACES_LOCK = threading.Lock()
+
+# ★追加: 開催されていないレースを記憶するセット
+MISSING_RACES = set()
+MISSING_RACES_LOCK = threading.Lock()
 
 def log(msg):
     print(f"[{datetime.datetime.now(JST).strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -98,9 +104,14 @@ def report_worker(stop_event):
             time.sleep(60)
 
 def process_race(jcd, rno, today):
-    # 既に終了したレースはスキップ（ログは出さない）
+    # 既に終了したレースはスキップ
     with FINISHED_RACES_LOCK:
         if (jcd, rno) in FINISHED_RACES:
+            return
+
+    # ★追加: そもそも開催がない(NO_RACE)と判定済みの場合はスキップ
+    with MISSING_RACES_LOCK:
+        if (jcd, rno) in MISSING_RACES:
             return
 
     sess = get_session()
@@ -108,17 +119,24 @@ def process_race(jcd, rno, today):
     
     # 1. データ取得
     try:
+        # scraper.pyを更新し、errorとして詳細なコードを受け取る必要があります
         raw, error = scrape_race_data(sess, jcd, rno, today)
     except Exception as e:
         with STATS_LOCK: STATS["errors"] += 1
         log(f"⚠️ {place}{rno}R データ取得例外: {e}")
         return
 
-    # ★修正: 取得失敗時もカウント＆ログ出し
+    # ★重要: 「データなし(開催なし)」の場合は、無視リストに入れて次回からアクセスしない
+    if error == "NO_RACE":
+        with MISSING_RACES_LOCK:
+            MISSING_RACES.add((jcd, rno))
+        return
+
+    # その他のエラー（通信失敗など）はカウントしてリトライ対象のままにする
     if error or not raw:
         with STATS_LOCK: STATS["errors"] += 1
-        # 頻繁に出るようならコメントアウトしても良い
-        # log(f"⚠️ {place}{rno}R データ取得失敗") 
+        # 頻繁に出る場合はコメントアウト推奨
+        # log(f"⚠️ {place}{rno}R データ取得失敗 ({error})") 
         return
 
     # ★時間管理ロジック★
@@ -290,7 +308,7 @@ def main():
                     futures.append(ex.submit(process_race, jcd, rno, today))
             concurrent.futures.wait(futures)
 
-        # ★ ログを完全化: 全ての数字を表示
+        # ★ ログを完全化
         log(f"🏁 判定完了: 対象={STATS['scanned']}R -> 見送={STATS['passed']}R, 購入={STATS['hits']}R "
             f"(待機={STATS['waiting']}R, 期限切={STATS['skipped']}R, エラー={STATS['errors']}R)")
         
