@@ -12,13 +12,15 @@ def clean_text(text):
     return text.replace("\n", "").replace("\r", "").replace("¥", "").replace(",", "").strip()
 
 def get_session():
+    # Chrome 120 の指紋を模倣してBot対策を回避
     return requests.Session(impersonate="chrome120")
 
 def get_soup(session, url):
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://www.boatrace.jp/"
+            "Referer": "https://www.boatrace.jp/",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
         }
         res = session.get(url, headers=headers, timeout=15)
         if res.status_code != 200: return None
@@ -27,10 +29,10 @@ def get_soup(session, url):
         return BeautifulSoup(res.content, 'lxml')
     except: return None
 
-# ... (extract_deadline, scrape_race_data は変更なし。そのまま維持) ...
 def extract_deadline(soup, rno):
     if not soup: return None
     try:
+        # "締切" または "予定" を含むセルを探す
         candidates = soup.find_all(['th', 'td'], string=re.compile(r"締切|予定"))
         for tag in candidates:
             parent_row = tag.find_parent("tr")
@@ -39,18 +41,25 @@ def extract_deadline(soup, rno):
             time_cells = []
             for cell in cells:
                 txt = clean_text(cell.text)
+                # HH:MM 形式の時間を抽出
                 if re.search(r"\d{1,2}:\d{2}", txt):
                     time_cells.append(txt)
+            
+            # レース番号に対応する時間を取得
             if len(time_cells) >= 10:
                 if 1 <= rno <= len(time_cells):
                     target_time = time_cells[rno - 1]
                     m = re.search(r"(\d{1,2}:\d{2})", target_time)
                     if m: return m.group(1).zfill(5)
+            
+            # テーブル形式が違う場合（縦並びなど）
             next_tag = tag.find_next_sibling(['td', 'th'])
             if next_tag:
                 text = clean_text(next_tag.text)
                 m = re.search(r"(\d{1,2}:\d{2})", text)
                 if m: return m.group(1).zfill(5)
+            
+            # セル自体に時間が入っている場合
             text = clean_text(tag.text)
             m = re.search(r"(\d{1,2}:\d{2})", text)
             if m: return m.group(1).zfill(5)
@@ -61,7 +70,7 @@ def scrape_race_data(session, jcd, rno, date_str):
     base_url = "https://www.boatrace.jp/owpc/pc/race"
     url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_before = get_soup(session, url_before)
-    soup_list = None
+    
     url_list = f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_list = get_soup(session, url_list)
 
@@ -69,17 +78,24 @@ def scrape_race_data(session, jcd, rno, date_str):
 
     row = {
         'date': int(date_str), 'jcd': jcd, 'rno': rno, 'wind': 0.0,
-        'deadline_time': None,
-        'pid1':0, 'wr1':0.0, 'mo1':0.0, 'ex1':0.0, 'f1':0, 'st1':0.20,
-        'pid2':0, 'wr2':0.0, 'mo2':0.0, 'ex2':0.0, 'f2':0, 'st2':0.20,
-        'pid3':0, 'wr3':0.0, 'mo3':0.0, 'ex3':0.0, 'f3':0, 'st3':0.20,
-        'pid4':0, 'wr4':0.0, 'mo4':0.0, 'ex4':0.0, 'f4':0, 'st4':0.20,
-        'pid5':0, 'wr5':0.0, 'mo5':0.0, 'ex5':0.0, 'f5':0, 'st5':0.20,
-        'pid6':0, 'wr6':0.0, 'mo6':0.0, 'ex6':0.0, 'f6':0, 'st6':0.20,
+        'deadline_time': None
     }
+    
+    # 特徴量の初期化
+    for i in range(1, 7):
+        row[f'pid{i}'] = 0
+        row[f'wr{i}'] = 0.0
+        row[f'mo{i}'] = 0.0
+        row[f'ex{i}'] = 0.0
+        row[f'f{i}'] = 0
+        row[f'st{i}'] = 0.20
+
+    # 締切時間取得
     row['deadline_time'] = extract_deadline(soup_before, rno)
     if not row['deadline_time']:
         row['deadline_time'] = extract_deadline(soup_list, rno)
+        
+    # 風速取得 (直前情報)
     if soup_before:
         try:
             wind_unit = soup_before.select_one(".is-windDirection")
@@ -93,7 +109,10 @@ def scrape_race_data(session, jcd, rno, date_str):
                  m = re.search(r"風.*?(\d+)m", soup_before.text)
                  if m: row['wind'] = float(m.group(1))
         except: pass
+
+    # 各艇データの取得
     for i in range(1, 7):
+        # 直前情報から展示タイムを取得
         if soup_before:
             try:
                 boat_td = soup_before.select_one(f"td.is-boatColor{i}")
@@ -101,36 +120,53 @@ def scrape_race_data(session, jcd, rno, date_str):
                     tr = boat_td.find_parent("tr")
                     if tr:
                         text_all = clean_text(tr.text)
+                        # 展示タイム (6.xx or 7.xx)
                         matches = re.findall(r"(6\.\d{2}|7\.[0-4]\d)", text_all)
                         if matches: row[f'ex{i}'] = float(matches[-1])
             except: pass
+            
+        # 出走表から選手スペックを取得
         if soup_list:
             try:
                 tbodies = soup_list.select("tbody.is-fs12")
                 if len(tbodies) >= i:
                     tbody = tbodies[i-1]
                     txt_all = clean_text(tbody.text)
+                    
+                    # 登録番号
                     pid_match = re.search(r"([2-5]\d{3})", txt_all)
                     if pid_match: row[f'pid{i}'] = int(pid_match.group(1))
-                    full_row_text = txt_all 
-                    wr_matches = re.findall(r"(\d\.\d{2})", full_row_text)
+                    
+                    # 勝率 (全国/当地など複数あるが、最初のものを採用)
+                    wr_matches = re.findall(r"(\d\.\d{2})", txt_all)
                     for val_str in wr_matches:
                         val = float(val_str)
-                        if 1.0 <= val <= 9.99: row[f'wr{i}'] = val; break
-                    mo_matches = re.findall(r"(\d{2}\.\d{2})", full_row_text)
+                        if 1.0 <= val <= 9.99: 
+                            row[f'wr{i}'] = val
+                            break
+                            
+                    # モーター勝率 (2連対率)
+                    mo_matches = re.findall(r"(\d{2}\.\d{2})", txt_all)
                     for m_val in mo_matches:
-                        if 10.0 <= float(m_val) <= 99.9: row[f'mo{i}'] = float(m_val); break
-                    st_match = re.search(r"(0\.\d{2})", full_row_text)
+                        if 10.0 <= float(m_val) <= 99.9: 
+                            row[f'mo{i}'] = float(m_val)
+                            break
+                            
+                    # 平均ST
+                    st_match = re.search(r"(0\.\d{2})", txt_all)
                     if st_match: row[f'st{i}'] = float(st_match.group(1))
-                    f_match = re.search(r"F(\d+)", full_row_text)
+                    
+                    # フライング本数 F1, F2...
+                    f_match = re.search(r"F(\d+)", txt_all)
                     if f_match: row[f'f{i}'] = int(f_match.group(1))
             except: pass
+            
     return row, None
 
+# ★★★ 修正版: 全オッズ取得関数 ★★★
 def get_odds_map(session, jcd, rno, date_str):
     """
-    3連単の全オッズを取得し、辞書形式で返す
-    {'1-2-3': 10.5, '1-2-4': 12.0, ...}
+    3連単の全オッズを確実に取得する
     """
     url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup = get_soup(session, url)
@@ -144,6 +180,8 @@ def get_odds_map(session, jcd, rno, date_str):
     # 複数のテーブルに分かれている可能性も考慮し、合致する全テーブルを走査
     for tbl in tables:
         # 明確に「3連単」のオッズテーブルだけを対象にする
+        # テキストが取れない場合もあるので、クラス名や構造でもチェックできると良いが
+        # まずは「3連単」の文字が含まれるかを必須条件とする
         if "3連単" not in tbl.text:
             continue
             
@@ -153,6 +191,7 @@ def get_odds_map(session, jcd, rno, date_str):
         rows = tbody.select("tr")
 
         # 各列の状態管理（テーブルごとにリセット）
+        # 1号艇頭、2号艇頭... が横に並んでいる
         rowspan_counters = [0] * 6
         current_2nd_boats = [0] * 6
 
@@ -160,17 +199,20 @@ def get_odds_map(session, jcd, rno, date_str):
             tds = tr.select("td")
             col_cursor = 0
             
-            # 最大6列（1号艇〜6号艇頭）を想定
+            # 最大6列（1号艇〜6号艇頭）を走査
             for block_idx in range(6):
                 if col_cursor >= len(tds): break
                 
-                # テーブルが分かれている場合、block_idx は必ずしも 1号艇, 2号艇... と一致しない可能性があるが
-                # 公式サイトの構造上、左から順に詰まっているためこのループで処理可能
+                # ブロックのインデックス(0~5) + 1 = 1着の艇番
+                # ※テーブルが分割されている場合(1-3, 4-6など)はここを調整する必要があるが
+                # 公式PCサイトは通常、横一列(1-6)か、全て縦に並ぶ。
+                # 現行サイトでは横6列が標準。
                 current_1st = block_idx + 1 
                 
                 if rowspan_counters[block_idx] > 0:
                     # 結合中：3着とオッズのみ消費
                     if col_cursor + 1 >= len(tds): break
+                    
                     val_2nd = current_2nd_boats[block_idx]
                     
                     txt_3rd = clean_text(tds[col_cursor].text)
@@ -182,10 +224,16 @@ def get_odds_map(session, jcd, rno, date_str):
                 else:
                     # 新しい2着：2着、3着、オッズを消費
                     if col_cursor + 2 >= len(tds): break
+                    
                     td_2nd = tds[col_cursor]
                     txt_2nd = clean_text(td_2nd.text)
                     
-                    rs = int(td_2nd.get("rowspan", 1))
+                    # rowspan取得
+                    rs = 1
+                    if td_2nd.has_attr("rowspan"):
+                        try: rs = int(td_2nd["rowspan"])
+                        except: rs = 1
+                    
                     rowspan_counters[block_idx] = rs - 1
                     
                     try: val_2nd = int(txt_2nd)
@@ -199,19 +247,17 @@ def get_odds_map(session, jcd, rno, date_str):
 
                 # 辞書に保存
                 try:
-                    # 欠場などで数字でない場合はスキップ
+                    # 欠場などで「欠」となっている場合はスキップ
                     if val_2nd > 0 and txt_3rd.isdigit():
                         key = f"{current_1st}-{val_2nd}-{txt_3rd}"
-                        odds_map[key] = float(txt_odds)
+                        # オッズが「0.0」や「-」の場合は除外
+                        odds_val = float(txt_odds)
+                        if odds_val > 0:
+                            odds_map[key] = odds_val
                 except:
                     continue
 
     return odds_map
-
-# 互換性のため残すが、基本は get_odds_map を使う
-def get_exact_odds(session, jcd, rno, date_str, combo):
-    odds_map = get_odds_map(session, jcd, rno, date_str)
-    return odds_map.get(combo)
 
 def scrape_result(session, jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd:02d}&hd={date_str}"
@@ -238,6 +284,3 @@ def scrape_result(session, jcd, rno, date_str):
     except Exception: pass
     if not res['sanrentan_combo']: return None
     return res
-
-def scrape_odds(session, jcd, rno, date_str):
-    return get_odds_map(session, jcd, rno, date_str)
