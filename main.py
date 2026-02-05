@@ -7,7 +7,7 @@ import threading
 import sys
 import requests as std_requests
 
-# scraper.py と predict_boat.py はそのままでOK
+# scraper.py と predict_boat.py は最新のものを使用
 from scraper import scrape_race_data, get_session, get_odds_map, get_odds_2t, scrape_result
 from predict_boat import predict_race, attach_reason, load_models, filter_and_sort_bets
 
@@ -118,12 +118,11 @@ def process_race(jcd, rno, today):
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    # 開催なし
     if error == "NO_RACE":
         with MISSING_RACES_LOCK: MISSING_RACES.add((jcd, rno))
         return
 
-    # ★修正箇所: error が "OK" 以外の場合のみエラー扱いにする
+    # エラーチェック
     if (error != "OK") or not raw:
         with STATS_LOCK: 
             STATS["errors"] += 1
@@ -148,7 +147,6 @@ def process_race(jcd, rno, today):
             delta = deadline_dt - now
             minutes_left = delta.total_seconds() / 60
 
-            # 20分前ルール (デバッグ時はここを緩和してもよい)
             if minutes_left > 20:
                 with STATS_LOCK: STATS["waiting"] += 1
                 return
@@ -163,10 +161,15 @@ def process_race(jcd, rno, today):
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    if not candidates or not mode:
+    # 候補がなかった場合 (見送り)
+    if not candidates:
         with STATS_LOCK: 
             STATS["scanned"] += 1
             STATS["passed"] += 1
+        
+        # ★追加: 戦略対象の会場だが、自信度不足で見送った場合にログを出す
+        if mode:
+            log(f"👀 {place}{rno}R 見送り: 自信度不足 (MaxProb:{max_conf:.1%})")
         return
 
     # 3. オッズ取得
@@ -189,8 +192,10 @@ def process_race(jcd, rno, today):
     
     with STATS_LOCK: STATS["scanned"] += 1
     
+    # ★追加: EV不足で見送った場合にログを出す
     if not final_bets:
         with STATS_LOCK: STATS["passed"] += 1
+        log(f"👀 {place}{rno}R 見送り: 期待値不足 (MaxEV:{max_ev:.2f} < 基準{thresh})")
         return
 
     # 5. 投票＆通知
