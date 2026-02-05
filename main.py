@@ -7,7 +7,7 @@ import threading
 import sys
 import requests as std_requests
 
-# 必ず scraper.py と predict_boat.py も最新にしてください
+# scraper.py と predict_boat.py はそのままでOK
 from scraper import scrape_race_data, get_session, get_odds_map, get_odds_2t, scrape_result
 from predict_boat import predict_race, attach_reason, load_models, filter_and_sort_bets
 
@@ -42,7 +42,6 @@ def send_discord(content):
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    # 履歴テーブル作成
     conn.execute("CREATE TABLE IF NOT EXISTS history (race_id TEXT PRIMARY KEY, date TEXT, place TEXT, race_no INTEGER, predict_combo TEXT, status TEXT, profit INTEGER)")
     conn.close()
 
@@ -60,12 +59,10 @@ def report_worker(stop_event):
                     try: jcd = int(p['race_id'].split('_')[1])
                     except: continue
                     
-                    # 結果取得
                     res = scrape_result(sess, jcd, p['race_no'], p['date'])
                     if not res: continue
 
                     bet_combo = p['predict_combo']
-                    # 予測が2連単(XX-XX)か3連単(XX-XX-XX)かで判定
                     is_2t = len(bet_combo.split('-')) == 2
                     
                     if is_2t:
@@ -96,17 +93,16 @@ def report_worker(stop_event):
                             f"収支: {profit:+},円 (本日計: {total_profit:+,}円)"
                         )
                         log(f"{res_emoji} {p['place']}{p['race_no']}R 結果:{result_str} (予測:{bet_combo}) {profit:+}")
-                        if profit > 0: send_discord(msg) # 当たった時だけ通知
+                        if profit > 0: send_discord(msg)
                 conn.close()
         except Exception as e:
             pass
         
         for _ in range(10):
             if stop_event.is_set(): break
-            time.sleep(6) # 60秒待機
+            time.sleep(6)
 
 def process_race(jcd, rno, today):
-    # 終了済み・開催なしチェック
     with FINISHED_RACES_LOCK:
         if (jcd, rno) in FINISHED_RACES: return
     with MISSING_RACES_LOCK:
@@ -122,17 +118,20 @@ def process_race(jcd, rno, today):
         with STATS_LOCK: STATS["errors"] += 1
         return
 
+    # 開催なし
     if error == "NO_RACE":
         with MISSING_RACES_LOCK: MISSING_RACES.add((jcd, rno))
         return
-    if error or not raw:
+
+    # ★修正箇所: error が "OK" 以外の場合のみエラー扱いにする
+    if (error != "OK") or not raw:
         with STATS_LOCK: 
             STATS["errors"] += 1
-            # エラーの詳細をログに出す
-            log(f"⚠️ {place}{rno}R データ取得失敗: {error}")
+            if STATS["errors"] <= 5:
+                log(f"⚠️ {place}{rno}R データ取得失敗: {error}")
         return
 
-    # 締切時刻チェック
+    # 締切チェック
     deadline_str = raw.get('deadline_time')
     if deadline_str:
         try:
@@ -149,15 +148,14 @@ def process_race(jcd, rno, today):
             delta = deadline_dt - now
             minutes_left = delta.total_seconds() / 60
 
-            # 20分前でなければ待機
+            # 20分前ルール (デバッグ時はここを緩和してもよい)
             if minutes_left > 20:
                 with STATS_LOCK: STATS["waiting"] += 1
                 return
         except: pass
 
-    # 2. 予測 (モード判定: 2連単か3連単か)
+    # 2. 予測
     try:
-        # predict_boat.py の predict_race は (candidates, mode, max_conf) を返すように変更済
         ret = predict_race(raw)
         if not ret or len(ret) != 3: return
         candidates, mode, max_conf = ret
@@ -165,14 +163,13 @@ def process_race(jcd, rno, today):
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    # 対象外(見送り)の場合
     if not candidates or not mode:
         with STATS_LOCK: 
             STATS["scanned"] += 1
             STATS["passed"] += 1
         return
 
-    # 3. オッズ取得 (モードに合わせて使い分け)
+    # 3. オッズ取得
     odds_map = {}
     try:
         if mode == '2t':
@@ -194,7 +191,6 @@ def process_race(jcd, rno, today):
     
     if not final_bets:
         with STATS_LOCK: STATS["passed"] += 1
-        # log(f"👀 {place}{rno}R 見送り (MaxEV:{max_ev:.1f})")
         return
 
     # 5. 投票＆通知
@@ -203,7 +199,6 @@ def process_race(jcd, rno, today):
         conn = sqlite3.connect(DB_FILE)
         for p in final_bets:
             combo = p['combo']
-            # IDにモードを含めると安全かも知れないが、とりあえずコンボでユニークになる
             race_id = f"{today}_{jcd}_{rno}_{combo}" 
             
             if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone(): continue
@@ -232,7 +227,7 @@ def main():
     log("🚀 ハイブリッドBot (2連単厳選 & ノイズ除去) 起動")
     
     try:
-        load_models() # 初回ロード
+        load_models() 
         log("✅ モデル読み込み完了")
     except Exception as e:
         error_log(f"FATAL: モデル読み込みエラー: {e}")
@@ -245,9 +240,8 @@ def main():
     t.start()
     
     start_time = time.time()
-    MAX_RUNTIME = 18000 # 5時間
+    MAX_RUNTIME = 18000 
     
-    # ★ここが前回抜けていたメインループです★
     while True:
         if time.time() - start_time > MAX_RUNTIME:
             log("🔄 稼働時間上限(5時間)に達したため停止します")
@@ -277,7 +271,6 @@ def main():
                     futures.append(ex.submit(process_race, jcd, rno, today))
             concurrent.futures.wait(futures)
 
-        # ログ出力
         log(f"🏁 判定完了: 対象={STATS['scanned']}R -> 見送={STATS['passed']}R, 購入={STATS['hits']}R "
             f"(待機={STATS['waiting']}R, 期限切={STATS['skipped']}R, エラー={STATS['errors']}R)")
         
