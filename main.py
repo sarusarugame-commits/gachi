@@ -115,145 +115,154 @@ def report_worker(stop_event):
         time.sleep(120)
 
 def process_race(jcd, rno, today):
-    with FINISHED_RACES_LOCK:
-        if (jcd, rno) in FINISHED_RACES: return
-
-    sess = get_session()
-    place = PLACE_NAMES.get(jcd, "不明")
-    
     try:
-        raw, error = scrape_race_data(sess, jcd, rno, today)
-        if jcd == 11 and rno == 1: # DEBUG: Biwako 1R only
-             log(f"DEBUG: Biwako 1R Scrape Result: error={error}, raw_keys={list(raw.keys()) if raw else 'None'}")
-    except Exception as e:
-        if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R Scrape Exception: {e}")
-        with STATS_LOCK: STATS["errors"] += 1
-        return
+        with FINISHED_RACES_LOCK:
+            if (jcd, rno) in FINISHED_RACES: return
 
-    if error != "OK" or not raw:
-        # if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R Skipped due to error")
-        return
-
-    # 1. 時間管理 & 待機判定 (最優先)
-    # まず対象会場かどうかチェック (Waitカウントのため)
-    is_target = (jcd in STRATEGY_3T) or (jcd in STRATEGY_2T)
-    if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R is_target={is_target}")
-    
-    if not is_target: return
-
-    deadline_str = raw.get('deadline_time')
-    if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R deadline={deadline_str}")
-
-    if not deadline_str:
-        log(f"⚠️ [スキップ] {place}{rno}R: 締切時間不明のため処理できません")
-        with STATS_LOCK: STATS["errors"] += 1
-        return
-
-    try:
-        now = datetime.datetime.now(JST)
-        h, m = map(int, deadline_str.split(':'))
-        deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        sess = get_session()
+        place = PLACE_NAMES.get(jcd, "不明")
         
-        # 締切後 (1分経過)
-        if now > (deadline_dt + datetime.timedelta(minutes=1)):
-            with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
-            with STATS_LOCK: STATS["skipped"] += 1
+        try:
+            raw, error = scrape_race_data(sess, jcd, rno, today)
+            if jcd == 11 and rno == 1: # DEBUG: Biwako 1R only
+                 log(f"DEBUG: Biwako 1R Scrape Result: error={error}, raw_keys={list(raw.keys()) if raw else 'None'}")
+        except Exception as e:
+            if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R Scrape Exception: {e}")
+            with STATS_LOCK: STATS["errors"] += 1
             return
 
-        # 締切5分前より前なら待機
-        delta = deadline_dt - now
-        if delta.total_seconds() > 300: 
-            with STATS_LOCK: STATS["waiting"] += 1
+        if error != "OK" or not raw:
+            # if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R Skipped due to error")
             return
-    except Exception as e:
-        error_log(f"時間計算エラー {place}{rno}R: {e}")
-        return
 
-    # 2. 予測実行
-    try:
-        candidates, max_conf, _ = predict_race(raw)
-    except Exception as e:
-        error_log(f"予測エラー {place}{rno}R: {e}")
-        with STATS_LOCK: STATS["errors"] += 1
-        return
-
-    # --- 見送り理由ログ: 自信度不足 ---
-    if not candidates:
-        # 3Tか2Tかによって閾値の表示を変える（簡易的に3T基準で表示、または高い方）
-        thresh_display = max(CONF_THRESH_3T, CONF_THRESH_2T)
-        if max_conf > 0:
-            log(f"👀 [見送り] {place}{rno}R: 自信度不足 (AIスコア:{max_conf:.2f} < 基準:{thresh_display})")
-        with STATS_LOCK: STATS["vetted"] += 1
-        return
-
-    # 3. オッズ取得
-    odds_2t, odds_3t = {}, {}
-    has_2t = any(c['type'] == '2t' for c in candidates)
-    has_3t = any(c['type'] == '3t' for c in candidates)
-    
-    try:
-        if has_2t: odds_2t = get_odds_2t(sess, jcd, rno, today)
-        if has_3t: odds_3t = get_odds_map(sess, jcd, rno, today)
-    except Exception: pass
-
-    # 4. EVフィルタリング
-    try:
-        final_bets, max_ev, current_thresh = filter_and_sort_bets(candidates, odds_2t, odds_3t, jcd)
-    except: return
-
-    # --- 見送り理由ログ: 期待値(EV)不足 ---
-    if not final_bets:
-        # 候補はあったが、オッズと掛け合わせたら期待値が足りなかった場合
-        if max_ev > 0:
-            log(f"📉 [見送り] {place}{rno}R: 期待値不足 (最大EV:{max_ev:.2f} < 基準:{current_thresh})")
-        else:
-            log(f"📉 [見送り] {place}{rno}R: オッズ取得失敗または有効オッズなし")
+        # 1. 時間管理 & 待機判定 (最優先)
+        # まず対象会場かどうかチェック (Waitカウントのため)
+        try:
+            is_target = (jcd in STRATEGY_3T) or (jcd in STRATEGY_2T)
+            if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R is_target={is_target}")
+        except Exception as e:
+            log(f"FATAL: Strategy check failed for JCD={jcd}: {e}")
+            return
         
-        with STATS_LOCK: STATS["vetted"] += 1
-        return
+        if not is_target: return
 
-    # 5. 解説生成
-    try:
-        attach_reason(final_bets, raw, {})
-    except Exception: pass
+        deadline_str = raw.get('deadline_time')
+        if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R deadline={deadline_str}")
 
-    # 6. DB保存 & 通知
-    with STATS_LOCK: STATS["scanned"] += 1
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_FILE)
-        for p in final_bets:
-            combo = p['combo']
-            t_type = p['type']
-            race_id = f"{today}_{jcd}_{rno}_{combo}_{t_type}"
-            
-            if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone(): continue
+        if not deadline_str:
+            log(f"⚠️ [スキップ] {place}{rno}R: 締切時間不明のため処理できません")
+            with STATS_LOCK: STATS["errors"] += 1
+            return
 
-            prob = float(p.get('prob', 0))
-            reason = p.get('reason', '解説取得失敗')
-            odds_val = p.get('odds', 0.0)
-            ev_val = p.get('ev', 0.0)
+        try:
+            now = datetime.datetime.now(JST)
+            h, m = map(int, deadline_str.split(':'))
+            deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
             
-            log(f"🔥 [HIT] {place}{rno}R ({t_type.upper()}) -> {combo} ({odds_val}倍 EV:{ev_val:.2f})")
-            
-            odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds{'2t' if t_type=='2t' else '3t'}?rno={rno}&jcd={jcd:02d}&hd={today}"
+            # 締切後 (1分経過)
+            if now > (deadline_dt + datetime.timedelta(minutes=1)):
+                with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
+                with STATS_LOCK: STATS["skipped"] += 1
+                return
 
-            msg = (
-                f"🔥 **{place}{rno}R** {t_type.upper()}激アツ\n"
-                f"🎯 買い目: **{combo}**\n"
-                f"📊 確率: **{prob}%** / オッズ: **{odds_val}倍**\n"
-                f"💎 期待値: **{ev_val:.2f}**\n"
-                f"📝 AI寸評: {reason}\n"
-                f"🔗 [オッズ確認]({odds_url})"
-            )
+            # 締切5分前より前なら待機
+            delta = deadline_dt - now
+            if delta.total_seconds() > 300: 
+                with STATS_LOCK: STATS["waiting"] += 1
+                return
+        except Exception as e:
+            error_log(f"時間計算エラー {place}{rno}R: {e}")
+            return
+
+        # 2. 予測実行
+        try:
+            candidates, max_conf, _ = predict_race(raw)
+        except Exception as e:
+            error_log(f"予測エラー {place}{rno}R: {e}")
+            with STATS_LOCK: STATS["errors"] += 1
+            return
+
+        # --- 見送り理由ログ: 自信度不足 ---
+        if not candidates:
+            # 3Tか2Tかによって閾値の表示を変える（簡易的に3T基準で表示、または高い方）
+            thresh_display = max(CONF_THRESH_3T, CONF_THRESH_2T)
+            if max_conf > 0:
+                log(f"👀 [見送り] {place}{rno}R: 自信度不足 (AIスコア:{max_conf:.2f} < 基準:{thresh_display})")
+            with STATS_LOCK: STATS["vetted"] += 1
+            return
+
+        # 3. オッズ取得
+        odds_2t, odds_3t = {}, {}
+        has_2t = any(c['type'] == '2t' for c in candidates)
+        has_3t = any(c['type'] == '3t' for c in candidates)
+        
+        try:
+            if has_2t: odds_2t = get_odds_2t(sess, jcd, rno, today)
+            if has_3t: odds_3t = get_odds_map(sess, jcd, rno, today)
+        except Exception: pass
+
+        # 4. EVフィルタリング
+        try:
+            final_bets, max_ev, current_thresh = filter_and_sort_bets(candidates, odds_2t, odds_3t, jcd)
+        except: return
+
+        # --- 見送り理由ログ: 期待値(EV)不足 ---
+        if not final_bets:
+            # 候補はあったが、オッズと掛け合わせたら期待値が足りなかった場合
+            if max_ev > 0:
+                log(f"📉 [見送り] {place}{rno}R: 期待値不足 (最大EV:{max_ev:.2f} < 基準:{current_thresh})")
+            else:
+                log(f"📉 [見送り] {place}{rno}R: オッズ取得失敗または有効オッズなし")
             
-            conn.execute(
-                "INSERT INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (race_id, today, place, rno, combo, 'PENDING', 0, odds_val, prob, ev_val, reason, t_type)
-            )
-            conn.commit()
-            send_discord(msg)
-            with STATS_LOCK: STATS["hits"] += 1
-        conn.close()
+            with STATS_LOCK: STATS["vetted"] += 1
+            return
+
+        # 5. 解説生成
+        try:
+            attach_reason(final_bets, raw, {})
+        except Exception: pass
+
+        # 6. DB保存 & 通知
+        with STATS_LOCK: STATS["scanned"] += 1
+        with DB_LOCK:
+            conn = sqlite3.connect(DB_FILE)
+            for p in final_bets:
+                combo = p['combo']
+                t_type = p['type']
+                race_id = f"{today}_{jcd}_{rno}_{combo}_{t_type}"
+                
+                if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone(): continue
+
+                prob = float(p.get('prob', 0))
+                reason = p.get('reason', '解説取得失敗')
+                odds_val = p.get('odds', 0.0)
+                ev_val = p.get('ev', 0.0)
+                
+                log(f"🔥 [HIT] {place}{rno}R ({t_type.upper()}) -> {combo} ({odds_val}倍 EV:{ev_val:.2f})")
+                
+                odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds{'2t' if t_type=='2t' else '3t'}?rno={rno}&jcd={jcd:02d}&hd={today}"
+
+                msg = (
+                    f"🔥 **{place}{rno}R** {t_type.upper()}激アツ\n"
+                    f"🎯 買い目: **{combo}**\n"
+                    f"📊 確率: **{prob}%** / オッズ: **{odds_val}倍**\n"
+                    f"💎 期待値: **{ev_val:.2f}**\n"
+                    f"📝 AI寸評: {reason}\n"
+                    f"🔗 [オッズ確認]({odds_url})"
+                )
+                
+                conn.execute(
+                    "INSERT INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (race_id, today, place, rno, combo, 'PENDING', 0, odds_val, prob, ev_val, reason, t_type)
+                )
+                conn.commit()
+                send_discord(msg)
+                with STATS_LOCK: STATS["hits"] += 1
+            conn.close()
+    except Exception as e:
+        import traceback
+        error_log(f"CRITICAL ERROR in process_race ({place}{rno}R): {e}")
+        error_log(traceback.format_exc())
 
 def main():
     log(f"🚀 ハイブリッドAI Bot (ROI130% & 黄金律) 起動")
