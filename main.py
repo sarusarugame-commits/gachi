@@ -126,7 +126,10 @@ def process_race(jcd, rno, today):
         with MISSING_RACES_LOCK: MISSING_RACES.add((jcd, rno))
         return
     if error or not raw:
-        with STATS_LOCK: STATS["errors"] += 1
+        with STATS_LOCK: 
+            STATS["errors"] += 1
+            # エラーの詳細をログに出す
+            log(f"⚠️ {place}{rno}R データ取得失敗: {error}")
         return
 
     # 締切時刻チェック
