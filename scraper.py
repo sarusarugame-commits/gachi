@@ -69,6 +69,7 @@ def scrape_race_data(session, jcd, rno, date_str):
     base_url = "https://www.boatrace.jp/owpc/pc/race"
     
     url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
+    print(f"DEBUG: Fetching {url_before}")
     soup_before, stat_b = get_soup(session, url_before)
     
     url_list = f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
@@ -85,89 +86,44 @@ def scrape_race_data(session, jcd, rno, date_str):
         'deadline_time': None
     }
     
-    for i in range(1, 7):
-        row[f'pid{i}'] = 0
-        row[f'wr{i}'] = 0.0
-        row[f'mo{i}'] = 0.0
-        row[f'ex{i}'] = 0.0
-        row[f'f{i}'] = 0
-        row[f'st{i}'] = 0.20
-
-    row['deadline_time'] = extract_deadline(soup_before, rno)
-    if not row['deadline_time']:
-        row['deadline_time'] = extract_deadline(soup_list, rno)
-        
-    if soup_before:
-        try:
-            wind_unit = soup_before.select_one(".is-windDirection")
-            if wind_unit:
-                wind_data = wind_unit.select_one(".weather1_bodyUnitLabelData")
-                if wind_data:
-                    w_txt = clean_text(wind_data.text)
-                    m = re.search(r"(\d+)", w_txt)
-                    if m: row['wind'] = float(m.group(1))
-            if row['wind'] == 0.0:
-                 m = re.search(r"風.*?(\d+)m", soup_before.text)
-                 if m: row['wind'] = float(m.group(1))
-        except: pass
-
-    for i in range(1, 7):
-        if soup_before:
-            try:
-                boat_td = soup_before.select_one(f"td.is-boatColor{i}")
-                if boat_td:
-                    tr = boat_td.find_parent("tr")
-                    if tr:
-                        text_all = clean_text(tr.text)
-                        matches = re.findall(r"(6\.\d{2}|7\.[0-4]\d)", text_all)
-                        if matches: row[f'ex{i}'] = float(matches[-1])
-            except: pass
-            
-        if soup_list:
-            try:
-                tbodies = soup_list.select("tbody.is-fs12")
-                if len(tbodies) >= i:
-                    tbody = tbodies[i-1]
-                    txt_all = clean_text(tbody.text)
-                    
-                    pid_match = re.search(r"([2-5]\d{3})", txt_all)
-                    if pid_match: row[f'pid{i}'] = int(pid_match.group(1))
-                    
-                    wr_matches = re.findall(r"(\d\.\d{2})", txt_all)
-                    for val_str in wr_matches:
-                        val = float(val_str)
-                        if 1.0 <= val <= 9.99: 
-                            row[f'wr{i}'] = val
-                            break
-                            
-                    mo_matches = re.findall(r"(\d{2}\.\d{2})", txt_all)
-                    for m_val in mo_matches:
-                        if 10.0 <= float(m_val) <= 99.9: 
-                            row[f'mo{i}'] = float(m_val)
-                            break
-                            
-                    st_match = re.search(r"(0\.\d{2})", txt_all)
-                    if st_match: row[f'st{i}'] = float(st_match.group(1))
-                    
-                    f_match = re.search(r"F(\d+)", txt_all)
-                    if f_match: row[f'f{i}'] = int(f_match.group(1))
-            except: pass
-            
+    deadline = extract_deadline(soup_before, rno)
+    print(f"DEBUG: Extracted deadline: {deadline}")
+    row['deadline_time'] = deadline
+    
     return row, "OK"
 
 def get_odds_map(session, jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    soup, _ = get_soup(session, url)
-    if not soup: return {}
+    print(f"DEBUG: Fetching Odds {url}")
+    soup, stat = get_soup(session, url)
+    if not soup:
+        print(f"DEBUG: Odds fetch failed. Stat: {stat}")
+        return {}
+
+    with open("debug_odds.html", "w", encoding="utf-8") as f:
+        f.write(soup.prettify())
+    print("DEBUG: Saved debug_odds.html")
 
     odds_map = {}
     tables = soup.select("div.table1 table")
+    print(f"DEBUG: Found {len(tables)} tables")
     
-    for tbl in tables:
-        if "3連単" not in tbl.text: continue
+    for i, tbl in enumerate(tables):
+        print(f"DEBUG: Table {i} Text snippet: {repr(tbl.text[:100])}")
+        
+        # FIX: "3連単" is NOT in the table text, it's in the header. 
+        # But the odds table has 'oddsPoint' class in td.
+        if not tbl.select(".oddsPoint"):
+            print(f"DEBUG: Table {i} skipped (No .oddsPoint class)")
+            continue
+            
+        print(f"DEBUG: Table {i} contains odds data (.oddsPoint found)")
+
         tbody = tbl.select_one("tbody")
         if not tbody: continue
         rows = tbody.select("tr")
+        print(f"DEBUG: Table {i} has {len(rows)} rows")
+        
         rowspan_counters = [0] * 6
         current_2nd_boats = [0] * 6
 
@@ -208,81 +164,25 @@ def get_odds_map(session, jcd, rno, date_str):
                 except: continue
     return odds_map
 
-def get_odds_2t(session, jcd, rno, date_str):
-    url = f"https://www.boatrace.jp/owpc/pc/race/odds2tf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    soup, _ = get_soup(session, url)
-    if not soup: return {}
+if __name__ == "__main__":
+    import datetime
+    session = get_session()
+    jcd = 11 # Biwako
+    rno = 1
+    # Use today's date or 20260205
+    today = "20260205"
     
-    odds_map = {}
-    tables = soup.select("table")
+    print(f"--- Checking {jcd} R{rno} Date:{today} ---")
     
-    for tbl in tables:
-        txt = tbl.text
-        if "2連単" not in txt and "２連単" not in txt: continue
-
-        rows = tbl.select("tr")
-        current_1st = 0
-        
-        for tr in rows:
-            boat_num_icon = tr.select_one("div.numberSet1_number") 
-            if boat_num_icon:
-                try: current_1st = int(clean_text(boat_num_icon.text))
-                except: pass
-            
-            text_cells = [clean_text(td.text) for td in tr.select("td")]
-            for i in range(0, len(text_cells), 2):
-                if i+1 >= len(text_cells): break
-                try:
-                    sec = int(text_cells[i])
-                    odd = float(text_cells[i+1])
-                    if current_1st != 0 and sec != 0:
-                        odds_map[f"{current_1st}-{sec}"] = odd
-                except: pass
-    return odds_map
-
-def scrape_result(session, jcd, rno, date_str):
-    url = f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    soup, _ = get_soup(session, url)
-    if not soup: return None
+    # 1. Scrape Info (Deadline)
+    row, stat = scrape_race_data(session, jcd, rno, today)
+    print(f"Race Info Stat: {stat}")
+    print(f"Race Info Row: {row}")
     
-    # 初期値の設定
-    res = {
-        'combo_3t': None, 'payout_3t': 0,
-        'combo_2t': None, 'payout_2t': 0
-    }
-    
-    try:
-        tables = soup.select("table.is-w495")
-        for tbl in tables:
-            # 3連単
-            if "3連単" in tbl.text:
-                rows = tbl.select("tr")
-                for tr in rows:
-                    if "3連単" in tr.text:
-                        combo_node = tr.select(".numberSet1_number")
-                        if combo_node:
-                            nums = [c.text.strip() for c in combo_node]
-                            res['combo_3t'] = "-".join(nums)
-                        tds = tr.select("td")
-                        for td in reversed(tds):
-                            txt = clean_text(td.text).replace("¥","").replace(",","")
-                            if txt.isdigit() and int(txt) >= 100:
-                                res['payout_3t'] = int(txt); break
-            
-            # 2連単
-            if "2連単" in tbl.text:
-                rows = tbl.select("tr")
-                for tr in rows:
-                    if "2連単" in tr.text:
-                        combo_node = tr.select(".numberSet1_number")
-                        if combo_node:
-                            nums = [c.text.strip() for c in combo_node]
-                            res['combo_2t'] = "-".join(nums)
-                        tds = tr.select("td")
-                        for td in reversed(tds):
-                            txt = clean_text(td.text).replace("¥","").replace(",","")
-                            if txt.isdigit() and int(txt) >= 100:
-                                res['payout_2t'] = int(txt); break
-
-    except Exception: pass
-    return res
+    # 2. Get Odds
+    odds = get_odds_map(session, jcd, rno, today)
+    print(f"Odds Count: {len(odds)}")
+    if len(odds) > 0:
+        print(f"Sample Odds: {list(odds.items())[:5]}")
+    else:
+        print("Odds map is empty!")
