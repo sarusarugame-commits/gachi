@@ -149,56 +149,50 @@ def process_race(jcd, rno, today):
                 return
         except: pass
 
-    # 2. 予測
+    # 2. 予測 (2連単/3連単 混在リストが返る)
     try:
-        ret = predict_race(raw)
-        if not ret or len(ret) != 3: return
-        candidates, mode, max_conf = ret
+        candidates = predict_race(raw)
     except Exception as e:
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    # 候補がなかった場合 (見送り)
     if not candidates:
         with STATS_LOCK: 
             STATS["scanned"] += 1
             STATS["passed"] += 1
-        
-        # ★理由を表示
-        if mode:
-            log(f"👀 {place}{rno}R 見送り: 自信度不足 (MaxProb:{max_conf:.1%})")
-        else:
-            log(f"👀 {place}{rno}R 見送り: 戦略対象外 (JCD{jcd})")
+        log(f"👀 {place}{rno}R 見送り: 戦略対象外")
         return
 
-    # 3. オッズ取得
-    odds_map = {}
+    # 3. オッズ取得 (必要な種類だけ取る)
+    odds_2t = {}
+    odds_3t = {}
+    
+    has_2t = any(c['type'] == '2t' for c in candidates)
+    has_3t = any(c['type'] == '3t' for c in candidates)
+    
     try:
-        if mode == '2t':
-            odds_map = get_odds_2t(sess, jcd, rno, today)
-        else:
-            odds_map = get_odds_map(sess, jcd, rno, today)
+        if has_2t: odds_2t = get_odds_2t(sess, jcd, rno, today)
+        if has_3t: odds_3t = get_odds_map(sess, jcd, rno, today)
     except: pass
 
-    if not odds_map:
+    if (has_2t and not odds_2t) or (has_3t and not odds_3t):
         with STATS_LOCK: STATS["errors"] += 1
         return
 
     # 4. EVフィルタ
     try:
-        final_bets, max_ev, thresh = filter_and_sort_bets(candidates, odds_map, jcd, mode)
+        final_bets, max_ev, thresh = filter_and_sort_bets(candidates, odds_2t, odds_3t, jcd)
     except: return
     
     with STATS_LOCK: STATS["scanned"] += 1
     
-    # ★理由を表示
     if not final_bets:
         with STATS_LOCK: STATS["passed"] += 1
         log(f"👀 {place}{rno}R 見送り: 期待値不足 (MaxEV:{max_ev:.2f} < 基準{thresh})")
         return
 
     # 5. 投票＆通知
-    attach_reason(final_bets, raw, odds_map)
+    attach_reason(final_bets, raw, {})
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE)
         for p in final_bets:
@@ -207,6 +201,8 @@ def process_race(jcd, rno, today):
             
             if conn.execute("SELECT 1 FROM history WHERE race_id=?", (race_id,)).fetchone(): continue
             
+            # モードごとにログを分ける
+            mode = p['type']
             log(f"🔥 [BUY {mode.upper()}] {place}{rno}R -> {combo} (EV:{p['ev']:.1f})")
             
             odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds{mode}f?rno={rno}&jcd={jcd:02d}&hd={today}"
@@ -215,9 +211,8 @@ def process_race(jcd, rno, today):
                 f"🔥 **{place}{rno}R** 厳選{mode.upper()}勝負！\n"
                 f"⏰ 締切: **{deadline_str}** (あと{minutes_left:.0f}分)\n"
                 f"🎯 買い目: **{combo}**\n"
-                f"💰 期待値: **{p['ev']:.2f}** (基準{thresh})\n"
+                f"💰 期待値: **{p['ev']:.2f}** (基準{p.get('reason', '').split('基準')[1][:-1]})\n"
                 f"📊 確率: {p['prob']}% / オッズ: {p['odds']}倍\n"
-                f"📝 {p.get('reason','')}\n"
                 f"🔗 [オッズ確認]({odds_url})"
             )
             
@@ -228,7 +223,7 @@ def process_race(jcd, rno, today):
         conn.close()
 
 def main():
-    log("🚀 ハイブリッドBot (2連単厳選 & 全ログ出力) 起動")
+    log("🚀 ダブルBot (2連単&3連単 同時攻略) 起動")
     
     try:
         load_models() 
