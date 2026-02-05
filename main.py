@@ -10,7 +10,7 @@ import json
 
 # scraper, predict_boat は同じフォルダに配置してください
 from scraper import scrape_race_data, get_session, get_odds_map, get_odds_2t, scrape_result
-from predict_boat import predict_race, attach_reason, load_model, filter_and_sort_bets, CONF_THRESH_3T, CONF_THRESH_2T
+from predict_boat import predict_race, attach_reason, load_model, filter_and_sort_bets, CONF_THRESH_3T, CONF_THRESH_2T, STRATEGY_3T, STRATEGY_2T
 
 DB_FILE = "race_data.db"
 PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
@@ -124,31 +124,18 @@ def process_race(jcd, rno, today):
         
         try:
             raw, error = scrape_race_data(sess, jcd, rno, today)
-            if jcd == 11 and rno == 1: # DEBUG: Biwako 1R only
-                 log(f"DEBUG: Biwako 1R Scrape Result: error={error}, raw_keys={list(raw.keys()) if raw else 'None'}")
         except Exception as e:
-            if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R Scrape Exception: {e}")
             with STATS_LOCK: STATS["errors"] += 1
             return
 
-        if error != "OK" or not raw:
-            # if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R Skipped due to error")
-            return
+        if error != "OK" or not raw: return
 
         # 1. 時間管理 & 待機判定 (最優先)
         # まず対象会場かどうかチェック (Waitカウントのため)
-        try:
-            is_target = (jcd in STRATEGY_3T) or (jcd in STRATEGY_2T)
-            if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R is_target={is_target}")
-        except Exception as e:
-            log(f"FATAL: Strategy check failed for JCD={jcd}: {e}")
-            return
-        
+        is_target = (jcd in STRATEGY_3T) or (jcd in STRATEGY_2T)
         if not is_target: return
 
         deadline_str = raw.get('deadline_time')
-        if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R deadline={deadline_str}")
-
         if not deadline_str:
             log(f"⚠️ [スキップ] {place}{rno}R: 締切時間不明のため処理できません")
             with STATS_LOCK: STATS["errors"] += 1
