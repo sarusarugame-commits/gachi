@@ -123,20 +123,27 @@ def process_race(jcd, rno, today):
     
     try:
         raw, error = scrape_race_data(sess, jcd, rno, today)
-    except:
+        if jcd == 11 and rno == 1: # DEBUG: Biwako 1R only
+             log(f"DEBUG: Biwako 1R Scrape Result: error={error}, raw_keys={list(raw.keys()) if raw else 'None'}")
+    except Exception as e:
+        if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R Scrape Exception: {e}")
         with STATS_LOCK: STATS["errors"] += 1
         return
 
-    if error != "OK" or not raw: return
-
-    if error != "OK" or not raw: return
+    if error != "OK" or not raw:
+        # if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R Skipped due to error")
+        return
 
     # 1. 時間管理 & 待機判定 (最優先)
     # まず対象会場かどうかチェック (Waitカウントのため)
     is_target = (jcd in STRATEGY_3T) or (jcd in STRATEGY_2T)
+    if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R is_target={is_target}")
+    
     if not is_target: return
 
     deadline_str = raw.get('deadline_time')
+    if jcd == 11 and rno == 1: log(f"DEBUG: Biwako 1R deadline={deadline_str}")
+
     if not deadline_str:
         log(f"⚠️ [スキップ] {place}{rno}R: 締切時間不明のため処理できません")
         with STATS_LOCK: STATS["errors"] += 1
