@@ -2,89 +2,103 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 import os
+import zipfile
+import time
+import random
 from itertools import permutations
 
 # ==========================================
-# ⚙️ 設定: ダブルエンジン (2連単 & 3連単 同時狙い)
+# ⚙️ 設定: 券種別・完全独立パラメータ
 # ==========================================
-MODEL_FILE_3T = "boatrace_model.txt"    # 3連単用
-MODEL_FILE_2T = "boatrace_model_2t.txt" # 2連単用
 
-# ----------------------------------------------------
-# 📊 戦略設定 (シミュレーション結果の完全移植)
-# ----------------------------------------------------
-
-# 【二連単】 回収率130% 厳選設定
-STRATEGY_2T = {
-    8:  4.0,  # 常滑
-    10: 4.0,  # 三国
-    16: 3.0,  # 児島
-    21: 2.5,  # 芦屋
-}
-
-# 【三連単】 回収率124% 攻撃設定 (2022除外Sim結果)
+# --- 三連単 (3T) 黄金律設定 [OOFsimulation.py] ---
+MIN_PROB_3T = 0.03
+ODDS_CAP_3T = 40.0
+MAX_BETS_3T = 6
+CONF_THRESH_3T = 0.20
+# 会場別EV閾値 (シミュレーション結果準拠)
 STRATEGY_3T = {
-    2:  2.0,  # 戸田
-    3:  1.2,  # 江戸川
-    5:  2.0,  # 多摩川
-    6:  1.6,  # 浜名湖
-    8:  1.8,  # 常滑 (2連単と重複！両方狙う)
-    9:  1.4,  # 津
-    10: 1.3,  # 三国 (重複！)
-    11: 2.5,  # びわこ
-    13: 1.6,  # 住之江
-    14: 1.6,  # 尼崎
-    16: 1.5,  # 児島 (重複！)
-    19: 1.3,  # 下関
-    20: 2.0,  # 若松
-    22: 1.2,  # 福岡
-    23: 1.5,  # 唐津
-    24: 1.5,  # 大村
+    2: 2.0, 3: 1.2, 5: 2.0, 6: 1.6, 8: 1.8, 9: 1.4, 10: 1.3,
+    11: 2.5, 13: 1.6, 14: 1.6, 16: 1.5, 19: 1.3, 20: 2.0,
+    22: 1.2, 23: 1.5, 24: 1.5
 }
 
-# 共通パラメータ
-MIN_PROB_THRESHOLD = 0.0005     # 3連単に合わせて極限まで下げる
-MAX_BETS_PER_RACE = 10          # 両方買う可能性があるので少し広げる
-CALC_ODDS_CAP = 300.0           # 3連単に合わせて上限開放
+# --- 二連単 (2T) ROI 130% 厳選設定 [OOFsimulation_2t.py] ---
+MIN_PROB_2T = 0.01
+ODDS_CAP_2T = 100.0
+MAX_BETS_2T = 8
+CONF_THRESH_2T = 0.0
+# 会場別EV閾値 (シミュレーション結果準拠)
+STRATEGY_2T = {
+    8: 4.0, 10: 4.0, 16: 3.0, 21: 2.5
+}
 
 # ==========================================
-# 🧠 モデル管理
+# 🤖 Groq (OpenAI Client Wrapper) 設定
 # ==========================================
+OPENAI_AVAILABLE = False
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    pass
+
+_GROQ_CLIENT = None
+
+def get_groq_client():
+    global _GROQ_CLIENT
+    if not OPENAI_AVAILABLE: return None
+    if _GROQ_CLIENT is None:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key: return None
+        try:
+            _GROQ_CLIENT = OpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=api_key,
+                max_retries=3, 
+                timeout=20.0
+            )
+        except: return None
+    return _GROQ_CLIENT
+
+# --- モデル管理 ---
 MODELS = {'3t': None, '2t': None}
 
-def load_models():
-    if MODELS['2t'] is None and os.path.exists(MODEL_FILE_2T):
-        print(f"📂 2連単モデル読込: {MODEL_FILE_2T}")
-        MODELS['2t'] = lgb.Booster(model_file=MODEL_FILE_2T)
-    
+def load_model():
+    """main.pyからの互換性のために3Tモデルを返すが、両方ロードする"""
     if MODELS['3t'] is None:
-        if os.path.exists(MODEL_FILE_3T):
-            print(f"📂 3連単モデル読込: {MODEL_FILE_3T}")
-            MODELS['3t'] = lgb.Booster(model_file=MODEL_FILE_3T)
+        if os.path.exists("boatrace_model.txt"):
+            MODELS['3t'] = lgb.Booster(model_file="boatrace_model.txt")
+        elif os.path.exists("boat_race_model_3t.txt"):
+            MODELS['3t'] = lgb.Booster(model_file="boat_race_model_3t.txt")
+    
+    if MODELS['2t'] is None and os.path.exists("boatrace_model_2t.txt"):
+        MODELS['2t'] = lgb.Booster(model_file="boatrace_model_2t.txt")
+        
+    return MODELS['3t']
 
 def to_float(val):
-    try: return float(val) if val else 0.0
+    try:
+        if val is None or val == "": return 0.0
+        return float(val)
     except: return 0.0
 
 # ==========================================
-# 🔮 予測 & 候補出し (両対応)
+# 🔮 1. 候補出し (3T / 2T 独立判定)
 # ==========================================
 def predict_race(raw):
     """
-    戻り値: candidates (リスト)
-    各候補に 'type': '2t' または '3t' が付与される
+    戻り値: (候補リスト, 最大自信度, 戦略対象フラグ)
     """
-    load_models()
-    jcd = raw.get('jcd', 0)
-    
-    # この会場で有効な戦略があるかチェック
-    use_2t = jcd in STRATEGY_2T
+    load_model()
+    jcd = int(raw.get('jcd', 0))
     use_3t = jcd in STRATEGY_3T
+    use_2t = jcd in STRATEGY_2T
     
-    if not use_2t and not use_3t:
-        return [] # 戦略対象外
+    if not use_3t and not use_2t:
+        return [], 0.0, False
 
-    # 特徴量作成
+    # 特徴量生成
     rows = []
     ex_list = []
     wind = to_float(raw.get('wind', 0.0))
@@ -102,103 +116,129 @@ def predict_race(raw):
             'f': to_float(raw.get(f'f{s}', 0)),
         })
     
-    if sum(ex_list) == 0: return []
+    if sum(ex_list) == 0: return [], 0.0, True
 
-    df_race = pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
     for col in ['wr', 'mo', 'ex', 'st']:
-        mean = df_race[col].mean(); std = df_race[col].std()
-        if std == 0: std = 1e-6
-        df_race[f'{col}_z'] = (df_race[col] - mean) / std
+        m, s = df[col].mean(), df[col].std()
+        df[f'{col}_z'] = (df[col] - m) / (s if s != 0 else 1e-6)
 
-    df_race['jcd'] = df_race['jcd'].astype('category')
-    df_race['pid'] = df_race['pid'].astype('category')
+    df['jcd'] = df['jcd'].astype('category')
+    df['pid'] = df['pid'].astype('category')
     features = ['jcd', 'boat_no', 'pid', 'wind', 'wr', 'mo', 'ex', 'st', 'f', 'wr_z', 'mo_z', 'ex_z', 'st_z']
     
     candidates = []
-    b = df_race['boat_no'].values
+    max_p1_3t = 0.0
+    b = df['boat_no'].values
 
-    # -------- 2連単 予測 --------
-    if use_2t and MODELS['2t']:
-        try:
-            preds = MODELS['2t'].predict(df_race[features])
-            p1, p2 = preds[:, 0], preds[:, 1]
-            for i, j in permutations(range(6), 2):
-                score = p1[i] * p2[j]
-                if score >= 0.01: # 2連単は1%以上で足切り
-                    candidates.append({
-                        'combo': f"{b[i]}-{b[j]}",
-                        'raw_prob': score,
-                        'prob': round(score * 100, 1),
-                        'type': '2t'
-                    })
-        except: pass
-
-    # -------- 3連単 予測 --------
-    if use_3t and MODELS['3t']:
-        try:
-            preds = MODELS['3t'].predict(df_race[features])
-            p1, p2, p3 = preds[:, 0], preds[:, 1], preds[:, 2]
+    # --- 三連単 判定 (黄金律) ---
+    if MODELS['3t'] and use_3t:
+        p = MODELS['3t'].predict(df[features])
+        p1, p2, p3 = p[:, 0], p[:, 1], p[:, 2]
+        max_p1_3t = max(p1)
+        if max_p1_3t >= CONF_THRESH_3T:
             for i, j, k in permutations(range(6), 3):
-                score = p1[i] * p2[j] * p3[k]
-                if score >= MIN_PROB_THRESHOLD: # 3連単は0.05%以上
+                prob = p1[i] * p2[j] * p3[k]
+                if prob >= MIN_PROB_3T:
                     candidates.append({
-                        'combo': f"{b[i]}-{b[j]}-{b[k]}",
-                        'raw_prob': score,
-                        'prob': round(score * 100, 1),
+                        'combo': f"{b[i]}-{b[j]}-{b[k]}", 
+                        'raw_prob': prob, 
+                        'prob': round(prob * 100, 1),
                         'type': '3t'
                     })
-        except: pass
 
-    # 確率順にソートして返す
+    # --- 二連単 判定 (厳選ROI130%) ---
+    if MODELS['2t'] and use_2t:
+        p_2t = MODELS['2t'].predict(df[features])
+        p1_2, p2_2 = p_2t[:, 0], p_2t[:, 1]
+        if max(p1_2) >= CONF_THRESH_2T:
+            for i, j in permutations(range(6), 2):
+                prob = p1_2[i] * p2_2[j]
+                if prob >= MIN_PROB_2T:
+                    candidates.append({
+                        'combo': f"{b[i]}-{b[j]}", 
+                        'raw_prob': prob, 
+                        'prob': round(prob * 100, 1),
+                        'type': '2t'
+                    })
+
     candidates.sort(key=lambda x: x['raw_prob'], reverse=True)
-    return candidates
+    return candidates, max_p1_3t, True
 
 # ==========================================
-# 💰 EVフィルタ (2t/3t 混合対応)
+# 💰 2. EVフィルタ
 # ==========================================
-def filter_and_sort_bets(candidates, odds_2t_map, odds_3t_map, jcd):
-    final_bets = []
+def filter_and_sort_bets(candidates, odds_2t, odds_3t, jcd):
+    final_2t, final_3t = [], []
     max_ev = 0.0
-    thresh_info = 0.0
-
-    # その会場の基準値を取得
-    thresh_2t = STRATEGY_2T.get(jcd, 99.9)
-    thresh_3t = STRATEGY_3T.get(jcd, 99.9)
-
-    for bet in candidates:
-        combo = bet['combo']
-        prob = bet['raw_prob']
-        b_type = bet['type']
-        
-        # タイプに応じたオッズと閾値を選択
-        if b_type == '2t':
-            real_odds = odds_2t_map.get(combo, 0.0)
-            threshold = thresh_2t
+    
+    for c in candidates:
+        combo = c['combo']
+        prob = c['raw_prob']
+        if c['type'] == '2t':
+            real_o = odds_2t.get(combo, 0.0)
+            if real_o == 0: continue
+            ev = prob * min(real_o, ODDS_CAP_2T)
+            if ev > max_ev: max_ev = ev
+            if ev >= STRATEGY_2T.get(jcd, 99.0):
+                c.update({'odds': real_o, 'ev': ev})
+                final_2t.append(c)
         else:
-            real_odds = odds_3t_map.get(combo, 0.0)
-            threshold = thresh_3t
-
-        if real_odds == 0: continue
-        
-        # キャップ適用 (3連単は300倍、2連単は100倍にしておく)
-        cap = 300.0 if b_type == '3t' else 100.0
-        calc_odds = min(real_odds, cap)
-        
-        ev = prob * calc_odds
-        
-        if ev > max_ev: 
-            max_ev = ev
-            thresh_info = threshold # ログ表示用
-        
-        if ev >= threshold:
-            bet['odds'] = real_odds
-            bet['ev'] = ev
-            bet['reason'] = f"EV:{ev:.2f} (基準{threshold})"
-            final_bets.append(bet)
+            real_o = odds_3t.get(combo, 0.0)
+            if real_o == 0: continue
+            ev = prob * min(real_o, ODDS_CAP_3T)
+            if ev > max_ev: max_ev = ev
+            if ev >= STRATEGY_3T.get(jcd, 99.0):
+                c.update({'odds': real_o, 'ev': ev})
+                final_3t.append(c)
             
-    final_bets.sort(key=lambda x: x['ev'], reverse=True)
-    return final_bets[:MAX_BETS_PER_RACE], max_ev, thresh_info
+    return final_2t[:MAX_BETS_2T] + final_3t[:MAX_BETS_3T], max_ev, (STRATEGY_3T.get(jcd) or STRATEGY_2T.get(jcd))
 
-def attach_reason(results, raw, odds_map):
+# ==========================================
+# 📝 3. 解説生成 (OpenAI Client Wrapper形式)
+# ==========================================
+def generate_batch_reasons(jcd, bets_info, raw_data):
+    client = get_groq_client()
+    if not client: return {}
+    
+    players_info = ""
+    for i in range(1, 7):
+        players_info += f"{i}号艇:勝率{raw_data.get(f'wr{i}',0)} "
+
+    bets_text = ""
+    for b in bets_info:
+        bets_text += f"- {b['combo']}({b['type'].upper()}): 確率{b['prob']}% オッズ{b['odds']} (期待値{b['ev']:.2f})\n"
+
+    prompt = f"""
+    ボートレース予想家として、以下の{jcd}場の買い目を解説せよ。
+    [選手] {players_info}
+    [買い目] {bets_text}
+    【指示】
+    各買い目について、なぜチャンスなのか 30文字以内 でコメント。
+    必ず 【勝負】 か 【見送り】 で始めること。
+    """
+    
+    try:
+        chat = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile", temperature=0.7, max_tokens=400
+        )
+        text = chat.choices[0].message.content
+        comments = {}
+        for line in text.split('\n'):
+            if ':' in line:
+                p = line.split(':', 1)
+                comments[p[0].strip()] = p[1].strip()
+        return comments
+    except: return {}
+
+def attach_reason(results, raw, odds_map=None):
+    if not results: return
+    jcd = raw.get('jcd', 0)
+    ai_comments = generate_batch_reasons(jcd, results, raw)
     for item in results:
-        item['reason'] = f"【勝負】AI厳選 ({item['type'].upper()}) EV:{item['ev']:.2f}"
+        ai_msg = ai_comments.get(item['combo'])
+        if ai_msg:
+            item['reason'] = f"{ai_msg} (EV:{item['ev']:.2f})"
+        else:
+            item['reason'] = f"【勝負】AI推奨 (EV:{item['ev']:.2f})"
