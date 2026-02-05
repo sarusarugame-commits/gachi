@@ -142,6 +142,13 @@ def process_race(jcd, rno, today):
 
     if not is_target: return
 
+    # 必須チェック: 締切時間が取得できていない場合は、時間が読めないのでスキップする (リスク回避)
+    deadline_str = raw.get('deadline_time')
+    if not deadline_str:
+        log(f"⚠️ [スキップ] {place}{rno}R: 締切時間不明のため処理できません")
+        with STATS_LOCK: STATS["errors"] += 1
+        return
+
     # --- 見送り理由ログ: 自信度不足 ---
     if not candidates:
         # 3Tか2Tかによって閾値の表示を変える（簡易的に3T基準で表示、または高い方）
@@ -191,7 +198,7 @@ def process_race(jcd, rno, today):
                 return
 
             delta = deadline_dt - now
-            if delta.total_seconds() > 1200: # 20分前
+            if delta.total_seconds() > 300: # 5分前までは見（ケン）
                 with STATS_LOCK: STATS["waiting"] += 1
                 return
         except: pass
