@@ -7,7 +7,6 @@ import threading
 import sys
 import requests as std_requests
 
-# scraper.py と predict_boat.py は最新のものを使用
 from scraper import scrape_race_data, get_session, get_odds_map, get_odds_2t, scrape_result
 from predict_boat import predict_race, attach_reason, load_models, filter_and_sort_bets
 
@@ -15,7 +14,6 @@ DB_FILE = "race_data.db"
 PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
 JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 
-# 日本語出力設定
 sys.stdout.reconfigure(encoding='utf-8')
 
 DB_LOCK = threading.Lock()
@@ -122,7 +120,6 @@ def process_race(jcd, rno, today):
         with MISSING_RACES_LOCK: MISSING_RACES.add((jcd, rno))
         return
 
-    # エラーチェック
     if (error != "OK") or not raw:
         with STATS_LOCK: 
             STATS["errors"] += 1
@@ -167,9 +164,11 @@ def process_race(jcd, rno, today):
             STATS["scanned"] += 1
             STATS["passed"] += 1
         
-        # ★追加: 戦略対象の会場だが、自信度不足で見送った場合にログを出す
+        # ★理由を表示
         if mode:
             log(f"👀 {place}{rno}R 見送り: 自信度不足 (MaxProb:{max_conf:.1%})")
+        else:
+            log(f"👀 {place}{rno}R 見送り: 戦略対象外 (JCD{jcd})")
         return
 
     # 3. オッズ取得
@@ -192,7 +191,7 @@ def process_race(jcd, rno, today):
     
     with STATS_LOCK: STATS["scanned"] += 1
     
-    # ★追加: EV不足で見送った場合にログを出す
+    # ★理由を表示
     if not final_bets:
         with STATS_LOCK: STATS["passed"] += 1
         log(f"👀 {place}{rno}R 見送り: 期待値不足 (MaxEV:{max_ev:.2f} < 基準{thresh})")
@@ -229,7 +228,7 @@ def process_race(jcd, rno, today):
         conn.close()
 
 def main():
-    log("🚀 ハイブリッドBot (2連単厳選 & ノイズ除去) 起動")
+    log("🚀 ハイブリッドBot (2連単厳選 & 全ログ出力) 起動")
     
     try:
         load_models() 
