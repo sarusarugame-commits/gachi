@@ -272,7 +272,7 @@ def scrape_result(session, jcd, rno, date_str):
             # 2連単
             if "2連単" in tbl.text:
                 rows = tbl.select("tr")
-               for tr in rows:
+                for tr in rows:
                     if "2連単" in tr.text:
                         combo_node = tr.select(".numberSet1_number")
                         if combo_node:
