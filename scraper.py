@@ -36,32 +36,36 @@ def get_soup(session, url):
 def extract_deadline(soup, rno):
     if not soup: return None
     try:
-        candidates = soup.find_all(['th', 'td'], string=re.compile(r"締切|予定"))
+        # 修正: string=re.compile(...) だと空白を含むテキストにヒットしない場合があるため、全探索する
+        candidates = soup.find_all(['th', 'td'])
         for tag in candidates:
-            parent_row = tag.find_parent("tr")
-            if not parent_row: continue
-            cells = parent_row.find_all(['td', 'th'])
-            time_cells = []
-            for cell in cells:
-                txt = clean_text(cell.text)
-                if re.search(r"\d{1,2}:\d{2}", txt):
-                    time_cells.append(txt)
-            
-            if len(time_cells) >= 10:
-                if 1 <= rno <= len(time_cells):
-                    target_time = time_cells[rno - 1]
-                    m = re.search(r"(\d{1,2}:\d{2})", target_time)
+            if "締切" in tag.text or "予定" in tag.text:
+                parent_row = tag.find_parent("tr")
+                if not parent_row: continue
+                cells = parent_row.find_all(['td', 'th'])
+                time_cells = []
+                for cell in cells:
+                    txt = clean_text(cell.text)
+                    if re.search(r"\d{1,2}:\d{2}", txt):
+                        time_cells.append(txt)
+                
+                if len(time_cells) >= 10:
+                    if 1 <= rno <= len(time_cells):
+                        target_time = time_cells[rno - 1]
+                        m = re.search(r"(\d{1,2}:\d{2})", target_time)
+                        if m: return m.group(1).zfill(5)
+                
+                # 直後のタグを見る(締切...の次が時間の場合)
+                next_tag = tag.find_next_sibling(['td', 'th'])
+                if next_tag:
+                    text = clean_text(next_tag.text)
+                    m = re.search(r"(\d{1,2}:\d{2})", text)
                     if m: return m.group(1).zfill(5)
-            
-            next_tag = tag.find_next_sibling(['td', 'th'])
-            if next_tag:
-                text = clean_text(next_tag.text)
+                
+                # 自身のテキストに含まれる場合
+                text = clean_text(tag.text)
                 m = re.search(r"(\d{1,2}:\d{2})", text)
                 if m: return m.group(1).zfill(5)
-            
-            text = clean_text(tag.text)
-            m = re.search(r"(\d{1,2}:\d{2})", text)
-            if m: return m.group(1).zfill(5)
     except Exception: pass
     return None
 
