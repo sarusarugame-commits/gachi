@@ -129,23 +129,44 @@ def process_race(jcd, rno, today):
 
     if error != "OK" or not raw: return
 
-    # 1. 予測実行 (会場フィルタリング含む)
-    try:
-        # candidates: 候補リスト
-        # max_conf: AIの最大自信度(確率)
-        # is_target: 戦略対象の会場かどうか
-        candidates, max_conf, is_target = predict_race(raw)
-    except Exception as e:
-        error_log(f"予測エラー {place}{rno}R: {e}")
-        with STATS_LOCK: STATS["errors"] += 1
-        return
+    if error != "OK" or not raw: return
 
+    # 1. 時間管理 & 待機判定 (最優先)
+    # まず対象会場かどうかチェック (Waitカウントのため)
+    is_target = (jcd in STRATEGY_3T) or (jcd in STRATEGY_2T)
     if not is_target: return
 
-    # 必須チェック: 締切時間が取得できていない場合は、時間が読めないのでスキップする (リスク回避)
     deadline_str = raw.get('deadline_time')
     if not deadline_str:
         log(f"⚠️ [スキップ] {place}{rno}R: 締切時間不明のため処理できません")
+        with STATS_LOCK: STATS["errors"] += 1
+        return
+
+    try:
+        now = datetime.datetime.now(JST)
+        h, m = map(int, deadline_str.split(':'))
+        deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        
+        # 締切後 (1分経過)
+        if now > (deadline_dt + datetime.timedelta(minutes=1)):
+            with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
+            with STATS_LOCK: STATS["skipped"] += 1
+            return
+
+        # 締切5分前より前なら待機
+        delta = deadline_dt - now
+        if delta.total_seconds() > 300: 
+            with STATS_LOCK: STATS["waiting"] += 1
+            return
+    except Exception as e:
+        error_log(f"時間計算エラー {place}{rno}R: {e}")
+        return
+
+    # 2. 予測実行
+    try:
+        candidates, max_conf, _ = predict_race(raw)
+    except Exception as e:
+        error_log(f"予測エラー {place}{rno}R: {e}")
         with STATS_LOCK: STATS["errors"] += 1
         return
 
@@ -158,26 +179,7 @@ def process_race(jcd, rno, today):
         with STATS_LOCK: STATS["vetted"] += 1
         return
 
-    # 4. 時間管理 (オッズ取得の前に移動)
-    deadline_str = raw.get('deadline_time')
-    if deadline_str:
-        try:
-            now = datetime.datetime.now(JST)
-            h, m = map(int, deadline_str.split(':'))
-            deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            
-            if now > (deadline_dt + datetime.timedelta(minutes=1)):
-                with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
-                with STATS_LOCK: STATS["skipped"] += 1
-                return
-
-            delta = deadline_dt - now
-            if delta.total_seconds() > 300: # 5分前までは見（ケン）
-                with STATS_LOCK: STATS["waiting"] += 1
-                return
-        except: pass
-
-    # 2. オッズ取得
+    # 3. オッズ取得
     odds_2t, odds_3t = {}, {}
     has_2t = any(c['type'] == '2t' for c in candidates)
     has_3t = any(c['type'] == '3t' for c in candidates)
@@ -187,7 +189,7 @@ def process_race(jcd, rno, today):
         if has_3t: odds_3t = get_odds_map(sess, jcd, rno, today)
     except Exception: pass
 
-    # 3. EVフィルタリング
+    # 4. EVフィルタリング
     try:
         final_bets, max_ev, current_thresh = filter_and_sort_bets(candidates, odds_2t, odds_3t, jcd)
     except: return
