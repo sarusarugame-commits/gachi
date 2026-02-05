@@ -8,7 +8,7 @@ from itertools import permutations
 # ⚙️ 設定: ダブルモデル & 厳選使い分け
 # ==========================================
 MODEL_FILE_3T = "boatrace_model.txt"    # 3連単用
-MODEL_FILE_2T = "boatrace_model_2t.txt" # 2連単用 (新設)
+MODEL_FILE_2T = "boatrace_model_2t.txt" # 2連単用
 
 # 【戦略】シミュレーション結果に基づく厳選設定
 # キー: JCD, 値: {'mode': '2t' or '3t', 'ev_thresh': float}
@@ -16,7 +16,7 @@ MODEL_FILE_2T = "boatrace_model_2t.txt" # 2連単用 (新設)
 STRATEGY_MAP = {
     8:  {'mode': '2t', 'thresh': 4.0},  # 常滑
     10: {'mode': '2t', 'thresh': 4.0},  # 三国
-    16: {'mode': '2t', 'thresh': 3.0},  # 蒲郡
+    16: {'mode': '2t', 'thresh': 3.0},  # 児島 (※蒲郡ではなく児島でした)
     21: {'mode': '2t', 'thresh': 2.5},  # 芦屋 (エース)
 }
 
@@ -36,7 +36,7 @@ def load_models():
         print(f"📂 2連単モデル読込: {MODEL_FILE_2T}")
         MODELS['2t'] = lgb.Booster(model_file=MODEL_FILE_2T)
     
-    # 3連単モデル (今回は使わない設定だが、拡張用に残す)
+    # 3連単モデル
     if MODELS['3t'] is None:
         if os.path.exists(MODEL_FILE_3T):
             print(f"📂 3連単モデル読込: {MODEL_FILE_3T}")
@@ -59,13 +59,12 @@ def predict_race(raw):
     # 戦略チェック: 買うべき会場か？
     strategy = STRATEGY_MAP.get(jcd)
     if not strategy:
-        return [], None, 0.0 # 見送り
+        return [], None, 0.0 # 見送り(対象外)
     
     mode = strategy['mode']
     model = MODELS.get(mode)
     
     if not model:
-        # モデルファイルがない場合などはスキップ
         return [], None, 0.0
 
     # 特徴量作成
@@ -101,10 +100,8 @@ def predict_race(raw):
     # 予測実行
     try:
         preds = model.predict(df_race[features])
-        # p1(1着率), p2(2着率)
         p1 = preds[:, 0]
         p2 = preds[:, 1]
-        # 3連単モデルの場合は p3 もあるが、今回は2連単メインなので無視or活用
         if mode == '3t': p3 = preds[:, 2]
     except: return [], None, 0.0
 
@@ -112,7 +109,6 @@ def predict_race(raw):
     candidates = []
     b = df_race['boat_no'].values
 
-    # ★ 2連単モードの生成
     if mode == '2t':
         for i, j in permutations(range(6), 2):
             score = p1[i] * p2[j]
@@ -123,7 +119,6 @@ def predict_race(raw):
                     'prob': round(score * 100, 1)
                 })
                 
-    # ★ 3連単モードの生成 (もし使うなら)
     elif mode == '3t':
         for i, j, k in permutations(range(6), 3):
             score = p1[i] * p2[j] * p3[k]
