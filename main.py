@@ -158,6 +158,25 @@ def process_race(jcd, rno, today):
         with STATS_LOCK: STATS["vetted"] += 1
         return
 
+    # 4. 時間管理 (オッズ取得の前に移動)
+    deadline_str = raw.get('deadline_time')
+    if deadline_str:
+        try:
+            now = datetime.datetime.now(JST)
+            h, m = map(int, deadline_str.split(':'))
+            deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            
+            if now > (deadline_dt + datetime.timedelta(minutes=1)):
+                with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
+                with STATS_LOCK: STATS["skipped"] += 1
+                return
+
+            delta = deadline_dt - now
+            if delta.total_seconds() > 300: # 5分前までは見（ケン）
+                with STATS_LOCK: STATS["waiting"] += 1
+                return
+        except: pass
+
     # 2. オッズ取得
     odds_2t, odds_3t = {}, {}
     has_2t = any(c['type'] == '2t' for c in candidates)
@@ -183,25 +202,6 @@ def process_race(jcd, rno, today):
         
         with STATS_LOCK: STATS["vetted"] += 1
         return
-
-    # 4. 時間管理
-    deadline_str = raw.get('deadline_time')
-    if deadline_str:
-        try:
-            now = datetime.datetime.now(JST)
-            h, m = map(int, deadline_str.split(':'))
-            deadline_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            
-            if now > (deadline_dt + datetime.timedelta(minutes=1)):
-                with FINISHED_RACES_LOCK: FINISHED_RACES.add((jcd, rno))
-                with STATS_LOCK: STATS["skipped"] += 1
-                return
-
-            delta = deadline_dt - now
-            if delta.total_seconds() > 300: # 5分前までは見（ケン）
-                with STATS_LOCK: STATS["waiting"] += 1
-                return
-        except: pass
 
     # 5. 解説生成
     try:
