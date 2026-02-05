@@ -3,7 +3,6 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 import re
 import unicodedata
 import warnings
-import datetime
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -25,29 +24,13 @@ def get_soup(session, url):
         }
         res = session.get(url, headers=headers, timeout=15)
         
-        # ★デバッグログ: 何が起きているか詳細を表示
-        # (エラーが多い時だけ有効にするため、通常はコメントアウト推奨だが今回は調査のため表示)
-        # print(f"[DEBUG] URL:{url[-20:]} | Status:{res.status_code} | Size:{len(res.content)}")
-
-        # 明確な「データなし」判定
         if "データがありません" in res.text: return None, "NO_RACE"
         if res.status_code == 404: return None, "NO_RACE"
-        
-        # その他のエラー（リトライ対象）
-        if res.status_code != 200: 
-            print(f"[ERROR] HTTPステータス異常: {res.status_code} URL:{url}")
-            return None, "HTTP_ERROR"
-        
-        # コンテンツサイズチェック（ここが怪しい）
-        if len(res.content) < 500: # 閾値を1000->500に緩和
-            print(f"[ERROR] コンテンツサイズ不足: {len(res.content)}bytes URL:{url}")
-            # 中身を少し表示して原因を探る
-            print(f"   Content: {res.text[:100]}...") 
-            return None, "SMALL_CONTENT"
+        if res.status_code != 200: return None, "HTTP_ERROR"
+        if len(res.content) < 500: return None, "SMALL_CONTENT"
         
         return BeautifulSoup(res.content, 'lxml'), "OK"
     except Exception as e:
-        print(f"[ERROR] 例外発生: {e} URL:{url}")
         return None, f"EXCEPTION_{e}"
 
 def extract_deadline(soup, rno):
@@ -85,21 +68,16 @@ def extract_deadline(soup, rno):
 def scrape_race_data(session, jcd, rno, date_str):
     base_url = "https://www.boatrace.jp/owpc/pc/race"
     
-    # 1. 直前情報
     url_before = f"{base_url}/beforeinfo?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_before, stat_b = get_soup(session, url_before)
     
-    # 2. 出走表
     url_list = f"{base_url}/racelist?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup_list, stat_l = get_soup(session, url_list)
 
-    # どちらかが明確に「開催なし」なら、そのレースは存在しないとみなす
     if stat_b == "NO_RACE" or stat_l == "NO_RACE":
         return None, "NO_RACE"
 
     if not soup_before and not soup_list: 
-        # 両方取れなかった場合のみエラー
-        # 片方だけ取れた場合は続行させてみる（情報不足でも予測できる可能性）
         return None, f"FETCH_ERR({stat_b}/{stat_l})"
 
     row = {
@@ -177,7 +155,6 @@ def scrape_race_data(session, jcd, rno, date_str):
             
     return row, "OK"
 
-# 3連単オッズ
 def get_odds_map(session, jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup, _ = get_soup(session, url)
@@ -231,7 +208,6 @@ def get_odds_map(session, jcd, rno, date_str):
                 except: continue
     return odds_map
 
-# ★2連単オッズ
 def get_odds_2t(session, jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/odds2tf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup, _ = get_soup(session, url)
@@ -242,22 +218,18 @@ def get_odds_2t(session, jcd, rno, date_str):
     
     for tbl in tables:
         txt = tbl.text
-        if "2連単" not in txt and "２連単" not in txt:
-             pass
+        if "2連単" not in txt and "２連単" not in txt: continue
 
         rows = tbl.select("tr")
         current_1st = 0
         
         for tr in rows:
             boat_num_icon = tr.select_one("div.numberSet1_number") 
-            if not boat_num_icon:
-                pass
-            else:
+            if boat_num_icon:
                 try: current_1st = int(clean_text(boat_num_icon.text))
                 except: pass
             
             text_cells = [clean_text(td.text) for td in tr.select("td")]
-            
             for i in range(0, len(text_cells), 2):
                 if i+1 >= len(text_cells): break
                 try:
@@ -266,18 +238,23 @@ def get_odds_2t(session, jcd, rno, date_str):
                     if current_1st != 0 and sec != 0:
                         odds_map[f"{current_1st}-{sec}"] = odd
                 except: pass
-                
     return odds_map
 
 def scrape_result(session, jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/raceresult?rno={rno}&jcd={jcd:02d}&hd={date_str}"
     soup, _ = get_soup(session, url)
     if not soup: return None
-    res = { 'combo': None, 'payout': 0, 'type': '3t' }
+    
+    # 初期値の設定
+    res = {
+        'combo_3t': None, 'payout_3t': 0,
+        'combo_2t': None, 'payout_2t': 0
+    }
     
     try:
         tables = soup.select("table.is-w495")
         for tbl in tables:
+            # 3連単
             if "3連単" in tbl.text:
                 rows = tbl.select("tr")
                 for tr in rows:
@@ -292,9 +269,10 @@ def scrape_result(session, jcd, rno, date_str):
                             if txt.isdigit() and int(txt) >= 100:
                                 res['payout_3t'] = int(txt); break
             
+            # 2連単
             if "2連単" in tbl.text:
                 rows = tbl.select("tr")
-                for tr in rows:
+               for tr in rows:
                     if "2連単" in tr.text:
                         combo_node = tr.select(".numberSet1_number")
                         if combo_node:
