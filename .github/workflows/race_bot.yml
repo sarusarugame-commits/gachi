@@ -52,10 +52,13 @@ jobs:
             echo "🚀 Botを起動します"
             echo "------------------------------------------------"
             
-            # Pythonを実行
+            # Pythonを実行 (エラーでも即終了しないように一時的に +e)
+            set +e
             python main.py
+            EXIT_CODE=$?
+            set -e
             
-            echo "⚠️ Botが停止しました。データを保存して再起動します..."
+            echo "⚠️ Botが停止しました (Exit Code: $EXIT_CODE)。データを保存チェックします..."
             
             # ▼▼▼ 停止のたびにデータを保存（ここに追加） ▼▼▼
             git fetch origin main
@@ -72,6 +75,12 @@ jobs:
             fi
             # ▲▲▲ 保存処理終了 ▲▲▲
 
-            echo "💤 10秒待機後に再起動します..."
+            # 正常終了(exit 0)の場合はループを抜けて終了
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "✅ 正常終了のため、再起動せずにジョブを完了します。"
+              break
+            fi
+
+            echo "💤 異常終了のため、10秒待機後に再起動します..."
             sleep 10
           done

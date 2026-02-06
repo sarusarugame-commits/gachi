@@ -342,7 +342,7 @@ def main():
     t.start()
     
     start_time = time.time()
-    MAX_RUNTIME = 21600 # 6時間
+    MAX_RUNTIME = 20700 # 5時間45分 (GitHub Actions 6時間制限回避のため)
     
     while True:
         if time.time() - start_time > MAX_RUNTIME:
