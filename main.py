@@ -316,7 +316,11 @@ def main():
             break
         
         now = datetime.datetime.now(JST)
-        if now.hour == 23 and now.minute >= 55: break
+        
+        # 夜間停止 (22:00 〜 08:00 は停止)
+        if now.hour >= 22 or now.hour < 8:
+            log(f"🌙 夜間のため稼働を終了します ({now.strftime('%H:%M')})")
+            break
             
         today = now.strftime('%Y%m%d')
         
