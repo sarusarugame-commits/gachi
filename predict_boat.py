@@ -312,6 +312,13 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
     【指示】
     各買い目について、なぜチャンスなのか 300文字以内 でコメント。
     「穴狙い」の視点を入れて解説すること。
+
+    【出力形式】
+    必ず以下の形式で1行につき1つの買い目の解説を出力すること。余計な挨拶は不要。
+    買い目: 解説文
+    
+    例:
+    1-2-3: 1号艇の逃げ信頼だが2号艇の差しも警戒...
     """
     
     try:
@@ -320,6 +327,7 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
             model="llama-3.3-70b-versatile", temperature=0.7, max_tokens=400
         )
         text = chat.choices[0].message.content
+        print(f"🤖 Groq Raw Response:\n{text}") # Debug log
         comments = {}
         for line in text.split('\n'):
             if ':' in line:
