@@ -219,7 +219,8 @@ def process_race(jcd, rno, today):
         try:
             if has_2t: odds_2t = get_odds_2t(sess, jcd, rno, today)
             if has_3t: odds_3t = get_odds_map(sess, jcd, rno, today)
-        except Exception: pass
+        except Exception as e:
+            error_log(f"オッズ取得例外 {place}{rno}R: {e}")
 
         # 4. EVフィルタリング
         try:
