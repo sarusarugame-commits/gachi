@@ -14,14 +14,14 @@ MIN_PROB_3T = 0.01
 ODDS_CAP_3T = 80.0        
 MAX_BETS_3T = 10          
 CONF_THRESH_3T = 0.15     
-STRATEGY_3T = {}          
+STRATEGY_3T = {i: {} for i in range(1, 25)}          
 
 # --- 二連単 (2T) 設定 ---
 MIN_PROB_2T = 0.01
 ODDS_CAP_2T = 100.0
 MAX_BETS_2T = 8
 CONF_THRESH_2T = 0.0
-STRATEGY_2T = {}
+STRATEGY_2T = {i: {} for i in range(1, 25)}
 
 # ==========================================
 # 🤖 Groq 設定
