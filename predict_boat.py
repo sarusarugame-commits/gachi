@@ -2,11 +2,11 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 import os
-import joblib # ★追加
+import joblib
 from itertools import permutations
 
 # ==========================================
-# ⚙️ 設定: 攻めの穴狙い設定 (ROI 143% Ver)
+# ⚙️ 設定: 攻めの穴狙い設定
 # ==========================================
 
 # --- 三連単 (3T) 攻めの設定 ---
@@ -51,35 +51,56 @@ def get_groq_client():
         except: return None
     return _GROQ_CLIENT
 
-# --- モデル管理 (一括ロード方式) ---
-ALL_MODELS = None
-MODEL_FILE = "boatrace_models_all.pkl" # ★まとめたファイル名
+# ==========================================
+# 📂 モデル管理 (2T:単一ファイル, 3T:一括pkl)
+# ==========================================
+MODELS_3T = None # 会場別辞書
+MODEL_2T = None  # 単一モデル
 
-def load_model():
-    """起動時に一括ファイルを読み込む"""
-    global ALL_MODELS
-    if ALL_MODELS is None:
-        if os.path.exists(MODEL_FILE):
-            try:
-                print(f"📂 モデル読み込み中: {MODEL_FILE}")
-                ALL_MODELS = joblib.load(MODEL_FILE)
-                print("✅ モデル読み込み完了")
-            except Exception as e:
-                print(f"❌ モデル読み込みエラー: {e}")
-                ALL_MODELS = {}
-        else:
-            print("⚠️ モデルファイルが見つかりません")
-            ALL_MODELS = {}
+FILE_3T = "boatrace_models_all.pkl"
+FILE_2T = "boatrace_model_2t.txt"
 
-def get_model_for_jcd(jcd):
-    """メモリ上の辞書から会場モデルを返す"""
-    global ALL_MODELS
-    if ALL_MODELS is None:
-        load_model()
+def load_models():
+    """起動時に2つのモデルを読み込む"""
+    global MODELS_3T, MODEL_2T
     
-    if ALL_MODELS and jcd in ALL_MODELS:
-        return ALL_MODELS[jcd]
-    return None
+    # --- 3連単 (会場別pkl) ---
+    if MODELS_3T is None:
+        if os.path.exists(FILE_3T):
+            try:
+                print(f"📂 3Tモデル読み込み中: {FILE_3T}")
+                MODELS_3T = joblib.load(FILE_3T)
+                print("✅ 3Tモデル読み込み完了")
+            except Exception as e:
+                print(f"❌ 3Tモデル読み込みエラー: {e}")
+                MODELS_3T = {}
+        else:
+            print(f"⚠️ 3Tモデルなし: {FILE_3T}")
+            MODELS_3T = {}
+
+    # --- 2連単 (全体txt) ---
+    if MODEL_2T is None:
+        if os.path.exists(FILE_2T):
+            try:
+                print(f"📂 2Tモデル読み込み中: {FILE_2T}")
+                MODEL_2T = lgb.Booster(model_file=FILE_2T)
+                print("✅ 2Tモデル読み込み完了")
+            except Exception as e:
+                print(f"❌ 2Tモデル読み込みエラー: {e}")
+                MODEL_2T = None
+        else:
+            print(f"⚠️ 2Tモデルなし: {FILE_2T}")
+            MODEL_2T = None
+
+def get_3t_model(jcd):
+    global MODELS_3T
+    if MODELS_3T is None: load_models()
+    return MODELS_3T.get(jcd)
+
+def get_2t_model():
+    global MODEL_2T
+    if MODEL_2T is None: load_models()
+    return MODEL_2T
 
 def to_float(val):
     try:
@@ -88,17 +109,12 @@ def to_float(val):
     except: return 0.0
 
 # ==========================================
-# 🔮 1. 候補出し (辞書型モデル対応)
+# 🔮 1. 候補出し (2T & 3T対応)
 # ==========================================
 def predict_race(raw):
     jcd = int(raw.get('jcd', 0))
     
-    # モデル取得
-    model = get_model_for_jcd(jcd)
-    if model is None:
-        return [], 0.0, 0.0, False
-
-    # 特徴量生成
+    # データフレーム作成
     rows = []
     ex_list = []
     wind = to_float(raw.get('wind', 0.0))
@@ -119,42 +135,82 @@ def predict_race(raw):
     if sum(ex_list) == 0: return [], 0.0, 0.0, True
 
     df = pd.DataFrame(rows)
+    # Zスコア計算
     for col in ['wr', 'mo', 'ex', 'st']:
         m, s = df[col].mean(), df[col].std()
         df[f'{col}_z'] = (df[col] - m) / (s if s != 0 else 1e-6)
 
     df['pid'] = df['pid'].astype('category')
     
-    # 学習時と同じ特徴量 (jcd除外)
+    # 特徴量リスト (学習時と合わせる)
     features = ['boat_no', 'pid', 'wind', 'wr', 'mo', 'ex', 'st', 'f', 'wr_z', 'mo_z', 'ex_z', 'st_z']
     
     candidates = []
+    b = df['boat_no'].values
+    
+    # ----------------------------------------
+    # 🎯 3連単予測 (会場別モデル)
+    # ----------------------------------------
     max_p1 = 0.0
     max_removed_prob = 0.0
-    b = df['boat_no'].values
+    
+    model_3t = get_3t_model(jcd)
+    if model_3t:
+        try:
+            # 3T用予測 (特徴量からjcdを除外したもので学習している前提)
+            p = model_3t.predict(df[features])
+            p1, p2, p3 = p[:, 0], p[:, 1], p[:, 2] 
+            
+            max_p1 = max(p1)
+            
+            if max_p1 >= CONF_THRESH_3T:
+                for i, j, k in permutations(range(6), 3):
+                    prob = p1[i] * p2[j] * p3[k]
+                    if prob > max_removed_prob: max_removed_prob = prob
+                    
+                    if prob >= MIN_PROB_3T:
+                        candidates.append({
+                            'combo': f"{b[i]}-{b[j]}-{b[k]}", 
+                            'raw_prob': prob, 
+                            'prob': round(prob * 100, 1),
+                            'type': '3t'
+                        })
+        except Exception as e:
+            print(f"⚠️ 3T予測エラー JCD{jcd}: {e}")
 
-    try:
-        p = model.predict(df[features])
-        p1, p2, p3 = p[:, 0], p[:, 1], p[:, 2] 
-        
-        current_max = max(p1)
-        max_p1 = max(max_p1, current_max)
-        
-        if current_max >= CONF_THRESH_3T:
-            for i, j, k in permutations(range(6), 3):
-                prob = p1[i] * p2[j] * p3[k]
-                if prob > max_removed_prob: max_removed_prob = prob
+    # ----------------------------------------
+    # 🎯 2連単予測 (全体モデル)
+    # ----------------------------------------
+    model_2t = get_2t_model()
+    if model_2t:
+        try:
+            # 2T用特徴量 (jcdを含める)
+            df_2t = df.copy()
+            df_2t['jcd'] = jcd
+            df_2t['jcd'] = df_2t['jcd'].astype('category')
+            
+            # 全体モデルは jcd を含む特徴量で学習している
+            features_2t = ['jcd'] + features
+            
+            p_2t = model_2t.predict(df_2t[features_2t])
+            # 多クラス分類 (0=1着, 1=2着...)
+            p1_2t, p2_2t = p_2t[:, 0], p_2t[:, 1]
+            
+            for i, j in permutations(range(6), 2):
+                prob = p1_2t[i] * p2_2t[j]
                 
-                if prob >= MIN_PROB_3T:
+                if prob >= MIN_PROB_2T:
                     candidates.append({
-                        'combo': f"{b[i]}-{b[j]}-{b[k]}", 
+                        'combo': f"{b[i]}-{b[j]}", 
                         'raw_prob': prob, 
                         'prob': round(prob * 100, 1),
-                        'type': '3t'
+                        'type': '2t'
                     })
-    except Exception as e:
-        print(f"Prediction Error JCD{jcd}: {e}")
-        return [], 0.0, 0.0, False
+        except Exception as e:
+            print(f"⚠️ 2T予測エラー JCD{jcd}: {e}")
+
+    if not candidates:
+        return [], 0.0, 0.0, True # 何も出なくてもエラーではない
 
     candidates.sort(key=lambda x: x['raw_prob'], reverse=True)
     return candidates, max_p1, max_removed_prob, True
@@ -165,27 +221,53 @@ def predict_race(raw):
 def filter_and_sort_bets(candidates, odds_2t, odds_3t, jcd):
     final_bets = []
     max_ev = 0.0
-    strategy_thresh = 1.5 
+    
+    # 戦略設定（2t, 3tで分けるならここ）
+    # 今回は簡易的に共通閾値だが、本来は辞書等で分ける
     
     for c in candidates:
         combo = c['combo']
         prob = c['raw_prob']
-        ev = 0.0
+        bet_type = c['type']
         
-        if c['type'] == '3t':
+        real_o = 0.0
+        cap = 100.0
+        thresh = 1.0 # デフォルト
+        
+        if bet_type == '3t':
             real_o = odds_3t.get(combo, 0.0)
-            if real_o > 0:
-                ev = prob * min(real_o, ODDS_CAP_3T)
-                if ev > max_ev: max_ev = ev
-                if ev >= strategy_thresh:
-                    c.update({'odds': real_o, 'ev': ev})
-                    final_bets.append(c)
+            cap = ODDS_CAP_3T
+            thresh = 1.5 # 3連単の閾値
+        elif bet_type == '2t':
+            real_o = odds_2t.get(combo, 0.0)
+            cap = ODDS_CAP_2T
+            thresh = 1.2 # 2連単は少し甘めでもOK(例)
+
+        if real_o > 0:
+            ev = prob * min(real_o, cap)
+            if ev > max_ev: max_ev = ev
+            
+            if ev >= thresh:
+                c.update({'odds': real_o, 'ev': ev})
+                final_bets.append(c)
     
+    # 賭け式ごとに購入数制限をかける処理が必要ならここに追加
+    # 今は単純にEV順で上位を返す
     final_bets.sort(key=lambda x: x['ev'], reverse=True)
-    return final_bets[:MAX_BETS_3T], max_ev, strategy_thresh
+    
+    # 3連単と2連単が混ざると見にくいので、上位からつまむが
+    # それぞれ MAX_BETS まで取得するようにする
+    
+    bets_3t = [b for b in final_bets if b['type'] == '3t'][:MAX_BETS_3T]
+    bets_2t = [b for b in final_bets if b['type'] == '2t'][:MAX_BETS_2T]
+    
+    merged = bets_3t + bets_2t
+    merged.sort(key=lambda x: x['ev'], reverse=True)
+    
+    return merged, max_ev, 0.0
 
 # ==========================================
-# 📝 3. 解説生成
+# 📝 3. 解説生成 (変更なし)
 # ==========================================
 def generate_batch_reasons(jcd, bets_info, raw_data):
     client = get_groq_client()
@@ -197,7 +279,7 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
 
     bets_text = ""
     for b in bets_info:
-        bets_text += f"- {b['combo']}: 確率{b['prob']}% オッズ{b['odds']} (期待値{b['ev']:.2f})\n"
+        bets_text += f"- {b['combo']}: 確率{b['prob']}% オッズ{b['odds']} (EV:{b['ev']:.2f})\n"
 
     prompt = f"""
     ボートレース予想家として、以下の{jcd}場の買い目を解説せよ。
@@ -225,10 +307,11 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
 def attach_reason(results, raw, odds_map=None):
     if not results: return
     jcd = raw.get('jcd', 0)
-    ai_comments = generate_batch_reasons(jcd, results, raw)
+    # 解説生成（コスト節約のため、上位3つくらいに絞っても良い）
+    ai_comments = generate_batch_reasons(jcd, results[:5], raw)
     for item in results:
         ai_msg = ai_comments.get(item['combo'])
         if ai_msg:
             item['reason'] = f"{ai_msg} (EV:{item['ev']:.2f})"
         else:
-            item['reason'] = f"【勝負】AI穴推奨 (EV:{item['ev']:.2f})"
+            item['reason'] = f"【勝負】AI推奨 (EV:{item['ev']:.2f})"
