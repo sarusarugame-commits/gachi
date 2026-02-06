@@ -93,7 +93,7 @@ def predict_race(raw):
     use_2t = jcd in STRATEGY_2T
     
     if not use_3t and not use_2t:
-        return [], 0.0, False
+        return [], 0.0, 0.0, False
 
     # 特徴量生成
     rows = []
@@ -113,7 +113,7 @@ def predict_race(raw):
             'f': to_float(raw.get(f'f{s}', 0)),
         })
     
-    if sum(ex_list) == 0: return [], 0.0, True
+    if sum(ex_list) == 0: return [], 0.0, 0.0, True
 
     df = pd.DataFrame(rows)
     for col in ['wr', 'mo', 'ex', 'st']:
@@ -126,6 +126,7 @@ def predict_race(raw):
     
     candidates = []
     max_p1 = 0.0
+    max_removed_prob = 0.0
     b = df['boat_no'].values
 
     # --- 三連単 判定 ---
@@ -138,6 +139,8 @@ def predict_race(raw):
         if current_max >= CONF_THRESH_3T:
             for i, j, k in permutations(range(6), 3):
                 prob = p1[i] * p2[j] * p3[k]
+                if prob > max_removed_prob: max_removed_prob = prob # 棄却された最大確率を記録
+                
                 if prob >= MIN_PROB_3T:
                     candidates.append({
                         'combo': f"{b[i]}-{b[j]}-{b[k]}", 
@@ -156,6 +159,8 @@ def predict_race(raw):
         if current_max >= CONF_THRESH_2T:
             for i, j in permutations(range(6), 2):
                 prob = p1_2[i] * p2_2[j]
+                if prob > max_removed_prob: max_removed_prob = prob
+
                 if prob >= MIN_PROB_2T:
                     candidates.append({
                         'combo': f"{b[i]}-{b[j]}", 
@@ -166,7 +171,7 @@ def predict_race(raw):
 
     # 確率順にソート (EV計算前の一時ソート)
     candidates.sort(key=lambda x: x['raw_prob'], reverse=True)
-    return candidates, max_p1, True
+    return candidates, max_p1, max_removed_prob, True
 
 # ==========================================
 # 💰 2. EVフィルタ
@@ -226,7 +231,7 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
     [選手] {players_info}
     [買い目] {bets_text}
     【指示】
-    各買い目について、なぜチャンスなのか 30文字以内 でコメント。
+    各買い目について、なぜチャンスなのか 300文字以内 でコメント。
     必ず 【勝負】 か 【見送り】 で始めること。
     """
     
