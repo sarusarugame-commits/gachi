@@ -237,23 +237,33 @@ def get_odds_2t(session, jcd, rno, date_str):
             continue
 
         rows = tbl.select("tr")
-        current_1st = 0
         
         for tr in rows:
-            boat_num_icon = tr.select_one("div.numberSet1_number") 
-            if boat_num_icon:
-                try: current_1st = int(clean_text(boat_num_icon.text))
-                except: pass
+            tds = tr.select("td")
+            # 2連単オッズ表は横に6ペア(12セル)並んでいる想定
+            if len(tds) < 12: continue 
             
-            text_cells = [clean_text(td.text) for td in tr.select("td")]
-            for i in range(0, len(text_cells), 2):
-                if i+1 >= len(text_cells): break
+            # 各列が1着艇(1~6)に対応し、セル内が[2着艇, オッズ]
+            for i in range(6):
+                idx_boat = i * 2
+                idx_odd = i * 2 + 1
+                if idx_odd >= len(tds): break
+                
                 try:
-                    sec = int(text_cells[i])
-                    odd = float(text_cells[i+1])
-                    if current_1st != 0 and sec != 0:
-                        odds_map[f"{current_1st}-{sec}"] = odd
-                except: pass
+                    sec_txt = clean_text(tds[idx_boat].text)
+                    odd_txt = clean_text(tds[idx_odd].text)
+                    
+                    if not sec_txt or not odd_txt: continue
+                    
+                    sec = int(sec_txt)
+                    odd = float(odd_txt)
+                    
+                    first = i + 1
+                    
+                    if first != 0 and sec != 0:
+                        odds_map[f"{first}-{sec}"] = odd
+                except ValueError: 
+                    pass
                 
     if not odds_map:
         print(f"⚠️ [2T] オッズマップが空です {jcd}場{rno}R (テーブル検出数: {len(tables)})")
