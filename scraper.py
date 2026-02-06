@@ -227,11 +227,14 @@ def get_odds_2t(session, jcd, rno, date_str):
         return {}
     
     odds_map = {}
-    tables = soup.select("table")
+    # Use specific class if available, or fallback to all tables (usually .table1 table)
+    tables = soup.select("div.table1 table")
+    if not tables: tables = soup.select("table")
     
     for tbl in tables:
-        txt = tbl.text
-        if "2連単" not in txt and "２連単" not in txt: continue
+        # 簡易チェック: 数字アイコンやオッズっぽいセルがあるか
+        if not tbl.select(".numberSet1_number") and not tbl.select(".oddsPoint"): 
+            continue
 
         rows = tbl.select("tr")
         current_1st = 0
