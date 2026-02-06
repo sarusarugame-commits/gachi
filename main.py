@@ -261,10 +261,11 @@ def process_race(jcd, rno, today):
                 
                 log(f"🔥 [HIT] {place}{rno}R ({t_type.upper()}) -> {combo} ({odds_val}倍 EV:{ev_val:.2f})")
                 
-                odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds{'2t' if t_type=='2t' else '3t'}?rno={rno}&jcd={jcd:02d}&hd={today}"
+                odds_url = f"https://www.boatrace.jp/owpc/pc/race/odds{'2tf' if t_type=='2t' else '3t'}?rno={rno}&jcd={jcd:02d}&hd={today}"
+                deadline_str = raw.get('deadline_time', '不明')
 
                 msg = (
-                    f"🔥 **{place}{rno}R** {t_type.upper()}激アツ\n"
+                    f"🔥 **{place}{rno}R** {t_type.upper()}激アツ (締切: {deadline_str})\n"
                     f"🎯 買い目: **{combo}**\n"
                     f"📊 確率: **{prob}%** / オッズ: **{odds_val}倍**\n"
                     f"💎 期待値: **{ev_val:.2f}**\n"

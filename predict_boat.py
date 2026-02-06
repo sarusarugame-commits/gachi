@@ -37,10 +37,14 @@ _GROQ_CLIENT = None
 
 def get_groq_client():
     global _GROQ_CLIENT
-    if not OPENAI_AVAILABLE: return None
+    if not OPENAI_AVAILABLE:
+        print("⚠️ Groq Error: 'openai' module not found. pip install openai")
+        return None
     if _GROQ_CLIENT is None:
         api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key: return None
+        if not api_key:
+            print("⚠️ Groq Error: GROQ_API_KEY env var not found.")
+            return None
         try:
             _GROQ_CLIENT = OpenAI(
                 base_url="https://api.groq.com/openai/v1",
@@ -48,7 +52,9 @@ def get_groq_client():
                 max_retries=3, 
                 timeout=20.0
             )
-        except: return None
+        except Exception as e:
+            print(f"⚠️ Groq Init Error: {e}")
+            return None
     return _GROQ_CLIENT
 
 # ==========================================
@@ -302,7 +308,10 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
                 p = line.split(':', 1)
                 comments[p[0].strip()] = p[1].strip()
         return comments
-    except: return {}
+        return comments
+    except Exception as e:
+        print(f"⚠️ Groq API Error: {e}")
+        return {}
 
 def attach_reason(results, raw, odds_map=None):
     if not results: return
