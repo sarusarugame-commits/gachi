@@ -122,19 +122,27 @@ def report_worker(stop_event):
                         conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, p['race_id']))
                         conn.commit()
 
-                        if is_hit:
-                            today_str = p['date']
-                            total_profit = conn.execute("SELECT SUM(profit) FROM history WHERE date=? AND status='FINISHED'", (today_str,)).fetchone()[0]
-                            if total_profit is None: total_profit = 0
-
-                            msg = (
-                                f"🎯 **{p['place']}{p['race_no']}R** 的中！({ticket_type.upper()})\n"
-                                f"買い目: {combo} ({p['odds']}倍)\n"
-                                f"払戻: {payout:,}円 (収支: +{profit:,}円)\n"
-                                f"📅 本日トータル: {total_profit:+,}円"
-                            )
-                            log(f"🎯 的中: {p['place']}{p['race_no']}R ({combo}) +{profit}円")
-                            send_discord(msg)
+                        # 収支集計
+                        today_str = p['date']
+                        month_str = today_str[:6] # YYYYMM
+                        
+                        total_profit_day = conn.execute("SELECT SUM(profit) FROM history WHERE date=? AND status='FINISHED'", (today_str,)).fetchone()[0] or 0
+                        total_profit_month = conn.execute("SELECT SUM(profit) FROM history WHERE substr(date,1,6)=? AND status='FINISHED'", (month_str,)).fetchone()[0] or 0
+                        
+                        result_emoji = "🎯" if is_hit else "💀"
+                        result_title = "的中！" if is_hit else "不的中..."
+                        
+                        msg = (
+                            f"{result_emoji} **{p['place']}{p['race_no']}R** {result_title} ({ticket_type.upper()})\n"
+                            f"買い目: {combo} (結果: {result_str})\n"
+                            f"収支: {'+' if profit>0 else ''}{profit:,}円\n"
+                            f"-------------------\n"
+                            f"📅 本日: {'+' if total_profit_day>0 else ''}{total_profit_day:,}円\n"
+                            f"🗓️ 今月: {'+' if total_profit_month>0 else ''}{total_profit_month:,}円"
+                        )
+                        
+                        log(f"{result_emoji} 結果: {p['place']}{p['race_no']}R ({combo}) {'+' if profit>0 else ''}{profit}円")
+                        send_discord(msg)
                 conn.close()
         except Exception as e:
             error_log(f"レポート監視エラー: {e}")
