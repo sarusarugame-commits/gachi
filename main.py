@@ -35,11 +35,15 @@ def send_discord(content):
     if not url: return
     try:
         std_requests.post(url, json={"content": content}, timeout=10)
-    except: pass
+    except Exception as e:
+        error_log(f"Discord通知エラー: {e}")
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
+    cursor = conn.cursor()
+    
+    # テーブル作成（存在しない場合）
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS history (
             race_id TEXT PRIMARY KEY,
             date TEXT,
@@ -55,6 +59,28 @@ def init_db():
             ticket_type TEXT
         )
     """)
+    
+    # カラム不足の自動修復 (マイグレーション)
+    cursor.execute("PRAGMA table_info(history)")
+    columns = [row[1] for row in cursor.fetchall()]
+    
+    required_columns = {
+        "odds": "REAL",
+        "prob": "REAL",
+        "ev": "REAL",
+        "comment": "TEXT",
+        "ticket_type": "TEXT"
+    }
+    
+    for col_name, col_type in required_columns.items():
+        if col_name not in columns:
+            try:
+                print(f"🔄 DBマイグレーション: カラム '{col_name}' を追加します...")
+                cursor.execute(f"ALTER TABLE history ADD COLUMN {col_name} {col_type}")
+            except Exception as e:
+                print(f"⚠️ マイグレーション警告: {e}")
+    
+    conn.commit()
     conn.close()
 
 def report_worker(stop_event):
@@ -170,11 +196,18 @@ def process_race(jcd, rno, today):
             return
 
         # --- 見送り理由ログ: 自信度不足 ---
+        # --- 見送り理由ログ: 自信度不足 ---
         if not candidates:
             # 3Tか2Tかによって閾値の表示を変える（簡易的に3T基準で表示、または高い方）
             thresh_display = max(CONF_THRESH_3T, CONF_THRESH_2T)
+            
             if max_conf > 0:
-                log(f"👀 [見送り] {place}{rno}R: 自信度不足 (AIスコア:{max_conf:.2f} < 基準:{thresh_display})")
+                if max_conf < thresh_display:
+                    log(f"👀 [見送り] {place}{rno}R: 自信度不足 (AIスコア:{max_conf:.2f} < 基準:{thresh_display})")
+                else:
+                    # 自信度は足りているが、個別の買い目確率が基準(MIN_PROB)に届かなかった場合
+                    log(f"👀 [見送り] {place}{rno}R: 組み合わせ確率不足 (AIスコア:{max_conf:.2f} >= 基準:{thresh_display})")
+            
             with STATS_LOCK: STATS["vetted"] += 1
             return
 
@@ -262,6 +295,13 @@ def main():
         sys.exit(1)
 
     init_db()
+    
+    # Discord設定確認
+    if os.environ.get("DISCORD_WEBHOOK_URL"):
+        log("ℹ️ Discord通知: ON")
+    else:
+        log("⚠️ Discord通知: OFF (環境変数が設定されていません)")
+
     stop_event = threading.Event()
     t = threading.Thread(target=report_worker, args=(stop_event,), daemon=True)
     t.start()
