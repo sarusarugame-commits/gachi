@@ -161,8 +161,10 @@ def scrape_race_data(session, jcd, rno, date_str):
 
 def get_odds_map(session, jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    soup, _ = get_soup(session, url)
-    if not soup: return {}
+    soup, status = get_soup(session, url)
+    if not soup:
+        print(f"⚠️ [3T] スープ取得失敗 {jcd}場{rno}R: {status}")
+        return {}
 
     odds_map = {}
     tables = soup.select("div.table1 table")
@@ -211,6 +213,10 @@ def get_odds_map(session, jcd, rno, date_str):
                         odds_val = float(txt_odds)
                         if odds_val > 0: odds_map[key] = odds_val
                 except: continue
+    
+    if not odds_map:
+        print(f"⚠️ [3T] オッズマップが空です {jcd}場{rno}R (テーブル検出数: {len(tables)})")
+        
     return odds_map
 
 def get_odds_2t(session, jcd, rno, date_str):
