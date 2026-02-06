@@ -57,6 +57,24 @@ def get_groq_client():
             return None
     return _GROQ_CLIENT
 
+def check_groq_setup():
+    """起動時にGroqの設定を確認する"""
+    print("🤖 Groqセットアップ確認中...")
+    if not OPENAI_AVAILABLE:
+        print("❌ 'openai' ライブラリが見つかりません。")
+        return
+    
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print("❌ 環境変数 GROQ_API_KEY が設定されていません。")
+        return
+    
+    client = get_groq_client()
+    if client:
+        print("✅ Groqクライアント初期化成功")
+    else:
+        print("❌ Groqクライアント初期化失敗")
+
 # ==========================================
 # 📂 モデル管理 (2T:単一ファイル, 3T:一括pkl)
 # ==========================================
