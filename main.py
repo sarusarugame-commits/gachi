@@ -287,6 +287,14 @@ def process_race(jcd, rno, today):
                     (race_id, today, place, rno, combo, 'PENDING', 0, odds_val, prob, ev_val, reason, t_type)
                 )
                 conn.commit()
+                
+                # 書き込み確認ログ
+                try:
+                    current_count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+                    log(f"💾 DB保存完了 [Total: {current_count}件] ID:{race_id}")
+                except:
+                    pass
+
                 send_discord(msg)
                 with STATS_LOCK: STATS["hits"] += 1
             conn.close()
@@ -307,6 +315,21 @@ def main():
         sys.exit(1)
 
     init_db()
+    
+    # 🐞 DBパスとレコード数確認用
+    try:
+        abs_db_path = os.path.abspath(DB_FILE)
+        log(f"📁 DBファイル絶対パス: {abs_db_path}")
+        if os.path.exists(abs_db_path):
+            conn = sqlite3.connect(DB_FILE)
+            cnt = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+            conn.close()
+            log(f"📊 現在のDBレコード数: {cnt}件")
+            log(f"📉 DBファイルサイズ: {os.path.getsize(abs_db_path)} bytes")
+        else:
+            log("⚠️ DBファイルがまだ存在しません")
+    except Exception as e:
+        error_log(f"DBチェックエラー: {e}")
     
     # Discord設定確認
     if os.environ.get("DISCORD_WEBHOOK_URL"):
