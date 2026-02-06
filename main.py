@@ -10,7 +10,7 @@ import json
 
 # scraper, predict_boat は同じフォルダに配置してください
 from scraper import scrape_race_data, get_session, get_odds_map, get_odds_2t, scrape_result
-from predict_boat import predict_race, attach_reason, load_model, filter_and_sort_bets, CONF_THRESH_3T, CONF_THRESH_2T, STRATEGY_3T, STRATEGY_2T, MIN_PROB_3T
+from predict_boat import predict_race, attach_reason, load_models, filter_and_sort_bets, CONF_THRESH_3T, CONF_THRESH_2T, STRATEGY_3T, STRATEGY_2T, MIN_PROB_3T
 
 DB_FILE = "race_data.db"
 PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
@@ -289,7 +289,7 @@ def main():
     log(f"🚀 ハイブリッドAI Bot (ROI130% & 黄金律) 起動")
     
     try:
-        load_model()
+        load_models()
         log("✅ AIモデル(2T/3T) 読み込み完了")
     except Exception as e:
         error_log(f"FATAL: モデル読み込みエラー: {e}")
