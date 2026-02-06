@@ -221,8 +221,10 @@ def get_odds_map(session, jcd, rno, date_str):
 
 def get_odds_2t(session, jcd, rno, date_str):
     url = f"https://www.boatrace.jp/owpc/pc/race/odds2tf?rno={rno}&jcd={jcd:02d}&hd={date_str}"
-    soup, _ = get_soup(session, url)
-    if not soup: return {}
+    soup, status = get_soup(session, url)
+    if not soup:
+        print(f"⚠️ [2T] スープ取得失敗 {jcd}場{rno}R: {status}")
+        return {}
     
     odds_map = {}
     tables = soup.select("table")
@@ -249,6 +251,10 @@ def get_odds_2t(session, jcd, rno, date_str):
                     if current_1st != 0 and sec != 0:
                         odds_map[f"{current_1st}-{sec}"] = odd
                 except: pass
+                
+    if not odds_map:
+        print(f"⚠️ [2T] オッズマップが空です {jcd}場{rno}R (テーブル検出数: {len(tables)})")
+        
     return odds_map
 
 def scrape_result(session, jcd, rno, date_str):
