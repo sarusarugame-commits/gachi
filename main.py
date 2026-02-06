@@ -10,7 +10,7 @@ import json
 
 # scraper, predict_boat は同じフォルダに配置してください
 from scraper import scrape_race_data, get_session, get_odds_map, get_odds_2t, scrape_result
-from predict_boat import predict_race, attach_reason, load_model, filter_and_sort_bets, CONF_THRESH_3T, CONF_THRESH_2T, STRATEGY_3T, STRATEGY_2T
+from predict_boat import predict_race, attach_reason, load_model, filter_and_sort_bets, CONF_THRESH_3T, CONF_THRESH_2T, STRATEGY_3T, STRATEGY_2T, MIN_PROB_3T
 
 DB_FILE = "race_data.db"
 PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
@@ -189,24 +189,24 @@ def process_race(jcd, rno, today):
 
         # 2. 予測実行
         try:
-            candidates, max_conf, _ = predict_race(raw)
+            candidates, max_conf, max_removed_prob, _ = predict_race(raw)
         except Exception as e:
             error_log(f"予測エラー {place}{rno}R: {e}")
             with STATS_LOCK: STATS["errors"] += 1
             return
 
         # --- 見送り理由ログ: 自信度不足 ---
-        # --- 見送り理由ログ: 自信度不足 ---
         if not candidates:
             # 3Tか2Tかによって閾値の表示を変える（簡易的に3T基準で表示、または高い方）
             thresh_display = max(CONF_THRESH_3T, CONF_THRESH_2T)
+            min_prob_display = MIN_PROB_3T # 厳密には2T等あるが代表値として
             
             if max_conf > 0:
                 if max_conf < thresh_display:
                     log(f"👀 [見送り] {place}{rno}R: 自信度不足 (AIスコア:{max_conf:.2f} < 基準:{thresh_display})")
                 else:
                     # 自信度は足りているが、個別の買い目確率が基準(MIN_PROB)に届かなかった場合
-                    log(f"👀 [見送り] {place}{rno}R: 組み合わせ確率不足 (AIスコア:{max_conf:.2f} >= 基準:{thresh_display})")
+                    log(f"👀 [見送り] {place}{rno}R: 組み合わせ確率不足 (AIスコア:{max_conf:.2f}OK 最大コンボ:{max_removed_prob*100:.1f}% < 基準:{min_prob_display*100:.0f}%)")
             
             with STATS_LOCK: STATS["vetted"] += 1
             return
