@@ -129,6 +129,16 @@ def report_worker(stop_event):
                         total_profit_day = conn.execute("SELECT SUM(profit) FROM history WHERE date=? AND status='FINISHED'", (today_str,)).fetchone()[0] or 0
                         total_profit_month = conn.execute("SELECT SUM(profit) FROM history WHERE substr(date,1,6)=? AND status='FINISHED'", (month_str,)).fetchone()[0] or 0
                         
+                        # 的中率集計 (2T)
+                        hits_2t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='2t' AND status='FINISHED' AND profit > 0", (today_str,)).fetchone()[0]
+                        total_2t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='2t' AND status='FINISHED'", (today_str,)).fetchone()[0]
+                        rate_2t = (hits_2t / total_2t * 100) if total_2t > 0 else 0.0
+
+                        # 的中率集計 (3T)
+                        hits_3t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='3t' AND status='FINISHED' AND profit > 0", (today_str,)).fetchone()[0]
+                        total_3t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='3t' AND status='FINISHED'", (today_str,)).fetchone()[0]
+                        rate_3t = (hits_3t / total_3t * 100) if total_3t > 0 else 0.0
+                        
                         result_emoji = "🎯" if is_hit else "💀"
                         result_title = "的中！" if is_hit else "不的中..."
                         
@@ -137,6 +147,8 @@ def report_worker(stop_event):
                             f"買い目: {combo} (結果: {result_str})\n"
                             f"収支: {'+' if profit>0 else ''}{profit:,}円\n"
                             f"-------------------\n"
+                            f"📊 2連単: {hits_2t}/{total_2t} ({rate_2t:.1f}%)\n"
+                            f"📊 3連単: {hits_3t}/{total_3t} ({rate_3t:.1f}%)\n"
                             f"📅 本日: {'+' if total_profit_day>0 else ''}{total_profit_day:,}円\n"
                             f"🗓️ 今月: {'+' if total_profit_month>0 else ''}{total_profit_month:,}円"
                         )
@@ -186,9 +198,9 @@ def process_race(jcd, rno, today):
                 with STATS_LOCK: STATS["skipped"] += 1
                 return
 
-            # 締切5分前より前なら待機
+            # 締切15分前より前なら待機
             delta = deadline_dt - now
-            if delta.total_seconds() > 300: 
+            if delta.total_seconds() > 900: 
                 with STATS_LOCK: STATS["waiting"] += 1
                 return
         except Exception as e:
