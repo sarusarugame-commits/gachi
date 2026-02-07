@@ -12,7 +12,7 @@ import json
 from scraper import scrape_race_data, get_session, get_odds_map, get_odds_2t, scrape_result
 from predict_boat import predict_race, attach_reason, load_models, filter_and_sort_bets, CONF_THRESH_3T, CONF_THRESH_2T, STRATEGY_3T, STRATEGY_2T, MIN_PROB_3T, check_groq_setup
 
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "race_data.db")
+DB_FILE = "race_data.db"
 PLACE_NAMES = {i: n for i, n in enumerate(["","桐生","戸田","江戸川","平和島","多摩川","浜名湖","蒲郡","常滑","津","三国","びわこ","住之江","尼崎","鳴門","丸亀","児島","宮島","徳山","下関","若松","芦屋","福岡","唐津","大村"])}
 JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 
@@ -84,135 +84,81 @@ def init_db():
     conn.close()
 
 def report_worker(stop_event):
-    log("ℹ️ レポート監視スレッド起動 (レース単位集約版)")
+    log("ℹ️ レポート監視スレッド起動 (2連単/3連単 両対応)")
     while not stop_event.is_set():
         try:
             with DB_LOCK:
                 conn = sqlite3.connect(DB_FILE)
                 conn.row_factory = sqlite3.Row
-                
-                # 未完了のレースを会場・R番号でグルーピングして取得
-                # race_id形式: YYYYMMDD_JCD_RNO_COMBO_TYPE
-                pending_bets = conn.execute("SELECT * FROM history WHERE status='PENDING'").fetchall()
-                if not pending_bets:
-                    conn.close()
-                    time.sleep(60)
-                    continue
-
-                # グルーピング: (date, jcd, rno) -> [bet_rows...]
-                race_groups = {}
-                for p in pending_bets:
-                    try:
-                        parts = p['race_id'].split('_')
-                        jcd = int(parts[1])
-                        key = (p['date'], jcd, p['race_no']) # date, jcd, rno
-                        if key not in race_groups: race_groups[key] = []
-                        race_groups[key].append(p)
-                    except: continue
-                
-                if not race_groups:
-                    conn.close()
-                    time.sleep(60)
-                    continue
-
+                pending = conn.execute("SELECT * FROM history WHERE status='PENDING'").fetchall()
                 sess = get_session()
                 
-                for key, bets in race_groups.items():
-                    date_str, jcd, rno = key
-                    place_name = bets[0]['place']
+                for p in pending:
+                    try:
+                        # race_id形式: YYYYMMDD_JCD_RNO_COMBO_TYPE
+                        parts = p['race_id'].split('_')
+                        jcd = int(parts[1])
+                    except: continue
                     
-                    # 1. 結果取得 (レース単位で1回だけ)
-                    res = scrape_result(sess, jcd, rno, date_str)
-                    if not res: continue # まだ結果が出ていない
-                    
-                    # 2. まとめて判定 & DB更新
-                    race_profit = 0
-                    results_summary = []
-                    hit_count = 0
-                    
-                    # 共通の結果文字列取得 (2t/3t両方確認)
-                    res_str_2t = res.get('combo_2t', '未確定')
-                    payout_2t = res.get('payout_2t', 0)
-                    res_str_3t = res.get('combo_3t', '未確定')
-                    payout_3t = res.get('payout_3t', 0)
-                    
-                    # 結果が両方とも未確定ならスキップ
-                    if (res_str_2t == "未確定" or res_str_2t is None) and (res_str_3t == "未確定" or res_str_3t is None):
-                        continue
+                    res = scrape_result(sess, jcd, p['race_no'], p['date'])
+                    if not res: continue
 
-                    # トランザクション更新
-                    updated = False
+                    combo = p['predict_combo']
+                    ticket_type = p['ticket_type'] # '2t' or '3t'
                     
-                    for bet in bets:
-                        combo = bet['predict_combo']
-                        t_type = bet['ticket_type']
-                        race_id = bet['race_id']
-                        
-                        if t_type == '2t':
-                            result_str = res_str_2t
-                            payout = payout_2t
-                        else:
-                            result_str = res_str_3t
-                            payout = payout_3t
-                        
-                        # 念のため結果が入っているか確認
-                        if result_str == "未確定" or result_str is None:
-                            continue # この券種の結果だけ出ていない等は稀だがスキップ
-
+                    # 修正: scraper.pyのキーに合わせて取得
+                    if ticket_type == '2t':
+                        result_str = res.get('combo_2t', '未確定')
+                        payout = res.get('payout_2t', 0)
+                    else:
+                        result_str = res.get('combo_3t', '未確定')
+                        payout = res.get('payout_3t', 0)
+                    
+                    if result_str != "未確定" and result_str is not None:
+                        # 的中判定
                         is_hit = (result_str == combo)
                         profit = payout - 100 if is_hit else -100
                         
-                        conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, race_id))
-                        race_profit += profit
-                        updated = True
+                        conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, p['race_id']))
+                        conn.commit()
+
+                        # 収支集計
+                        today_str = p['date']
+                        month_str = today_str[:6] # YYYYMM
                         
-                        hit_mark = "🎯" if is_hit else "💀"
-                        if is_hit: hit_count += 1
-                        results_summary.append(f"{hit_mark} {combo} (結果:{result_str}) {'+' if profit>0 else ''}{profit}円")
+                        total_profit_day = conn.execute("SELECT SUM(profit) FROM history WHERE date=? AND status='FINISHED'", (today_str,)).fetchone()[0] or 0
+                        total_profit_month = conn.execute("SELECT SUM(profit) FROM history WHERE substr(date,1,6)=? AND status='FINISHED'", (month_str,)).fetchone()[0] or 0
+                        
+                        # 的中率集計 (2T)
+                        hits_2t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='2t' AND status='FINISHED' AND profit > 0", (today_str,)).fetchone()[0]
+                        total_2t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='2t' AND status='FINISHED'", (today_str,)).fetchone()[0]
+                        rate_2t = (hits_2t / total_2t * 100) if total_2t > 0 else 0.0
 
-                    if not updated: continue
-                    conn.commit()
-                    
-                    # 3. 集計 & 通知作成
-                    month_str = date_str[:6]
-                    
-                    total_profit_day = conn.execute("SELECT SUM(profit) FROM history WHERE date=? AND status='FINISHED'", (date_str,)).fetchone()[0] or 0
-                    total_profit_month = conn.execute("SELECT SUM(profit) FROM history WHERE substr(date,1,6)=? AND status='FINISHED'", (month_str,)).fetchone()[0] or 0
-                    
-                    # 2連単成績
-                    hits_2t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='2t' AND status='FINISHED' AND profit > 0", (date_str,)).fetchone()[0]
-                    total_2t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='2t' AND status='FINISHED'", (date_str,)).fetchone()[0]
-                    rate_2t = (hits_2t / total_2t * 100) if total_2t > 0 else 0.0
-
-                    # 3連単成績
-                    hits_3t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='3t' AND status='FINISHED' AND profit > 0", (date_str,)).fetchone()[0]
-                    total_3t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='3t' AND status='FINISHED'", (date_str,)).fetchone()[0]
-                    rate_3t = (hits_3t / total_3t * 100) if total_3t > 0 else 0.0
-                    
-                    # メッセージ構築
-                    title_emoji = "🎉" if race_profit > 0 else "💀"
-                    title_text = "的中！" if hit_count > 0 else "残念..."
-                    
-                    details = "\n".join(results_summary)
-                    
-                    msg = (
-                        f"{title_emoji} **{place_name}{rno}R 結果** {title_text}\n"
-                        f"{details}\n"
-                        f"💰 レース収支: {'+' if race_profit>0 else ''}{race_profit:,}円\n"
-                        f"-------------------\n"
-                        f"📊 2連単: {hits_2t}/{total_2t} ({rate_2t:.1f}%)\n"
-                        f"📊 3連単: {hits_3t}/{total_3t} ({rate_3t:.1f}%)\n"
-                        f"📅 本日: {'+' if total_profit_day>0 else ''}{total_profit_day:,}円\n"
-                        f"🗓️ 今月: {'+' if total_profit_month>0 else ''}{total_profit_month:,}円"
-                    )
-                    
-                    log(f"📝 結果通知: {place_name}{rno}R (収支:{race_profit}円)")
-                    send_discord(msg)
-                    
+                        # 的中率集計 (3T)
+                        hits_3t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='3t' AND status='FINISHED' AND profit > 0", (today_str,)).fetchone()[0]
+                        total_3t = conn.execute("SELECT COUNT(*) FROM history WHERE date=? AND ticket_type='3t' AND status='FINISHED'", (today_str,)).fetchone()[0]
+                        rate_3t = (hits_3t / total_3t * 100) if total_3t > 0 else 0.0
+                        
+                        result_emoji = "🎯" if is_hit else "💀"
+                        result_title = "的中！" if is_hit else "不的中..."
+                        
+                        msg = (
+                            f"{result_emoji} **{p['place']}{p['race_no']}R** {result_title} ({ticket_type.upper()})\n"
+                            f"買い目: {combo} (結果: {result_str})\n"
+                            f"収支: {'+' if profit>0 else ''}{profit:,}円\n"
+                            f"-------------------\n"
+                            f"📊 2連単: {hits_2t}/{total_2t} ({rate_2t:.1f}%)\n"
+                            f"📊 3連単: {hits_3t}/{total_3t} ({rate_3t:.1f}%)\n"
+                            f"📅 本日: {'+' if total_profit_day>0 else ''}{total_profit_day:,}円\n"
+                            f"🗓️ 今月: {'+' if total_profit_month>0 else ''}{total_profit_month:,}円"
+                        )
+                        
+                        log(f"{result_emoji} 結果: {p['place']}{p['race_no']}R ({combo}) {'+' if profit>0 else ''}{profit}円")
+                        send_discord(msg)
                 conn.close()
         except Exception as e:
             error_log(f"レポート監視エラー: {e}")
-        time.sleep(60) # 頻度調整
+        time.sleep(120)
 
 def process_race(jcd, rno, today):
     try:
