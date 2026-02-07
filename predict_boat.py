@@ -383,7 +383,7 @@ def generate_batch_reasons(jcd, bets_info, raw_data):
     try:
         chat = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile", temperature=0.7, max_tokens=400
+            model="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0.7, max_tokens=400
         )
         text = chat.choices[0].message.content
         comments = {}
