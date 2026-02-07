@@ -144,7 +144,8 @@ def report_worker(stop_event):
                         final_odds_2t = get_odds_2t(sess, jcd, rno, date_str)
                         final_odds_3t = get_odds_map(sess, jcd, rno, date_str)
                     except Exception as e:
-                        error_log(f"最終オッズ取得エラー: {e}")
+                        # error_log(f"最終オッズ取得エラー: {e}")
+                        pass # オッズ取得エラーは致命的ではないので無視
                     
                     # 結果が両方とも未確定ならスキップ
                     if (res_str_2t == "未確定" or res_str_2t is None) and (res_str_3t == "未確定" or res_str_3t is None):
@@ -209,7 +210,7 @@ def report_worker(stop_event):
                     rate_3t = (hits_3t / total_3t * 100) if total_3t > 0 else 0.0
                     
                     # メッセージ構築
-                    title_emoji = "🎉" if race_profit > 0 else "💀"
+                    title_emoji = "�" if race_profit > 0 else "💀"
                     title_text = "的中！" if hit_count > 0 else "残念..."
                     
                     details = "\n".join(results_summary)
