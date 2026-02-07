@@ -69,7 +69,8 @@ def init_db():
         "prob": "REAL",
         "ev": "REAL",
         "comment": "TEXT",
-        "ticket_type": "TEXT"
+        "ticket_type": "TEXT",
+        "result_odds": "REAL"
     }
     
     for col_name, col_type in required_columns.items():
@@ -136,6 +137,15 @@ def report_worker(stop_event):
                     res_str_3t = res.get('combo_3t', '未確定')
                     payout_3t = res.get('payout_3t', 0)
                     
+                    # 最終オッズ取得 (乖離計測用)
+                    final_odds_2t = {}
+                    final_odds_3t = {}
+                    try:
+                        final_odds_2t = get_odds_2t(sess, jcd, rno, date_str)
+                        final_odds_3t = get_odds_map(sess, jcd, rno, date_str)
+                    except Exception as e:
+                        error_log(f"最終オッズ取得エラー: {e}")
+                    
                     # 結果が両方とも未確定ならスキップ
                     if (res_str_2t == "未確定" or res_str_2t is None) and (res_str_3t == "未確定" or res_str_3t is None):
                         continue
@@ -162,7 +172,16 @@ def report_worker(stop_event):
                         is_hit = (result_str == combo)
                         profit = payout - 100 if is_hit else -100
                         
-                        conn.execute("UPDATE history SET status='FINISHED', profit=? WHERE race_id=?", (profit, race_id))
+                        # 最終オッズ取得
+                        result_odds_val = 0.0
+                        try:
+                            if t_type == '2t':
+                                result_odds_val = final_odds_2t.get(combo, 0.0)
+                            else:
+                                result_odds_val = final_odds_3t.get(combo, 0.0)
+                        except: pass
+
+                        conn.execute("UPDATE history SET status='FINISHED', profit=?, result_odds=? WHERE race_id=?", (profit, result_odds_val, race_id))
                         race_profit += profit
                         updated = True
                         
@@ -349,8 +368,8 @@ def process_race(jcd, rno, today):
                 )
                 
                 conn.execute(
-                    "INSERT INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (race_id, today, place, rno, combo, 'PENDING', 0, odds_val, prob, ev_val, reason, t_type)
+                    "INSERT INTO history VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (race_id, today, place, rno, combo, 'PENDING', 0, odds_val, prob, ev_val, reason, t_type, 0.0)
                 )
                 conn.commit()
                 
